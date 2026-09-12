@@ -38,6 +38,34 @@ export interface Config {
      * Directory screenshots are written to and `cleanup` clears. Relative paths
      * resolve against the process working directory at resolve time.
      */ shotsDir?: string;
+    /**
+     * Dedicated browser environment. When enabled, a `browser_*` call that finds
+     * no extension link launches this user-data-dir first — that is what keeps
+     * dsh's debugger out of a daily profile shared with other extensions that
+     * also request `debugger` (Chrome allows one client per tab).
+     */
+    launch?: LaunchConfig;
+}
+/**
+ * Settings for the dedicated browser environment the bridge drives. Empty by
+ * default: without `enabled` plus a `profileDir` nothing is ever spawned, so an
+ * existing single-profile setup keeps behaving exactly as before.
+ */
+export interface LaunchConfig {
+    /** Bring the dedicated browser up when no extension is connected. */
+    enabled?: boolean;
+    /** Chrome binary; empty auto-detects from the usual per-OS locations. */
+    chromePath?: string;
+    /** user-data-dir of the dedicated environment. */
+    profileDir?: string;
+    /** Pages opened on launch. */
+    urls?: string[];
+    /** Extra Chrome switches appended verbatim. */
+    extraArgs?: string[];
+    /** Handshake budget per launch attempt, in milliseconds. */
+    waitMs?: number;
+    /** Rescue script run when the handshake times out (session-scoped CDP load). */
+    bootstrapScript?: string;
 }
 export declare const Config: z<Config>;
 /** Cordis plugin entry: wire the settings-driven lifecycle plus the model-facing tools. */

@@ -5,3 +5,5 @@ lib/tsconfig.tsbuildinfo
 *.crx
 .DS_Store
 *.tmp
+# 本地逆向调试残留（x-s/XYW_ 相关脚本与抓下来的 bundle）——不进公开仓库
+__xhs/

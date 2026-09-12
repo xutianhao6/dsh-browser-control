@@ -430,9 +430,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 /* Clean up when DevTools steals a tab (detach event fires). */
-chrome.debugger.onDetach.addListener((_source, reason) => {
+chrome.debugger.onDetach.addListener((source, reason) => {
+	// Any detach — DevTools opening on the tab, another debugger client taking
+	// it, a crashed target — must drop the tab from `attachedTabs`. Keeping the
+	// stale entry made every later call on that tab fail with
+	// "Debugger is not attached to the tab with id: N" until the tab closed.
+	const tabId = source?.tabId;
+	if (tabId !== undefined) attachedTabs.delete(tabId);
 	if (reason === 'target_closed' || reason === 'canceled_by_user') {
-		// attachedTabs cleanup is handled by chrome.tabs.onRemoved
+		// Buffers are dropped by chrome.tabs.onRemoved for closed tabs.
 	}
 });
 
@@ -449,7 +455,18 @@ function dbgSend(tabId, method, params) {
 /** Persistent CDP: attaches (if not already) and holds. */
 async function withCDP(tabId, fn) {
 	await ensureAttached(tabId);
-	return fn((method, params) => dbgSend(tabId, method, params));
+	try {
+		return await fn((method, params) => dbgSend(tabId, method, params));
+	} catch (error) {
+		// Chrome can drop an attachment without our bookkeeping noticing (service
+		// worker recycled, DevTools opened on the tab, another extension or a
+		// crash taking the target). Re-attach once and retry instead of failing
+		// the call with a stale "Debugger is not attached" error.
+		if (!/not attached to the tab/i.test(String((error && error.message) || error))) throw error;
+		attachedTabs.delete(tabId);
+		await ensureAttached(tabId);
+		return fn((method, params) => dbgSend(tabId, method, params));
+	}
 }
 
 /* ------------------------------------------------------- command handlers */
@@ -718,8 +735,14 @@ async function cmdEval(params) {
 	}
 	// params.timeoutMs races the evaluation: a hung awaitPromise (looping
 	// promise, blocked page) must fail at the caller's budget instead of
-	// riding the bridge-wide 60s default.
-	const evalTimeoutMs = Math.min(120_000, Math.max(100, Number(params.timeoutMs) || 0)) || null;
+	// riding the bridge-wide 60s default. An omitted budget means "no race" —
+	// the old `Math.max(100, Number(x) || 0)` collapsed that case to 100 ms, so
+	// every evaluate slower than a tenth of a second died with
+	// "eval timeout after 100ms" (fetches, multi-step page reads, awaits).
+	const requestedTimeout = Number(params.timeoutMs);
+	const evalTimeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+		? Math.min(120_000, Math.max(100, requestedTimeout))
+		: null;
 	const raceTimeout = (ms) => new Promise((_, reject) => setTimeout(() => {
 		const err = new Error(`eval timeout after ${ms}ms`);
 		err.code = 'eval_timeout';

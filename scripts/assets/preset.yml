@@ -1,0 +1,3 @@
+name: 浏览器操作
+description: 驱动一个专属 Chrome 环境：读页面、点按钮、填表单、上传、截图，并可在页面里执行 JS。选它就是让 Agent 去操作浏览器。
+order: 10

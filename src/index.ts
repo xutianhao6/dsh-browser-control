@@ -25,6 +25,7 @@ import type { JsonValue } from '@deepseek-ai/dsh-tools'
 import type { SettingsScope } from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-invariants'
 import { BridgeServer, cleanupArtifacts } from './server.ts'
+import { BrowserLauncher, type ResolvedLaunchConfig } from './launch.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'browser-bridge'
@@ -50,6 +51,35 @@ export interface Config {
 	 * Directory screenshots are written to and `cleanup` clears. Relative paths
 	 * resolve against the process working directory at resolve time.
 	 */	shotsDir?: string
+	/**
+	 * Dedicated browser environment. When enabled, a `browser_*` call that finds
+	 * no extension link launches this user-data-dir first — that is what keeps
+	 * dsh's debugger out of a daily profile shared with other extensions that
+	 * also request `debugger` (Chrome allows one client per tab).
+	 */
+	launch?: LaunchConfig
+}
+
+/**
+ * Settings for the dedicated browser environment the bridge drives. Empty by
+ * default: without `enabled` plus a `profileDir` nothing is ever spawned, so an
+ * existing single-profile setup keeps behaving exactly as before.
+ */
+export interface LaunchConfig {
+	/** Bring the dedicated browser up when no extension is connected. */
+	enabled?: boolean
+	/** Chrome binary; empty auto-detects from the usual per-OS locations. */
+	chromePath?: string
+	/** user-data-dir of the dedicated environment. */
+	profileDir?: string
+	/** Pages opened on launch. */
+	urls?: string[]
+	/** Extra Chrome switches appended verbatim. */
+	extraArgs?: string[]
+	/** Handshake budget per launch attempt, in milliseconds. */
+	waitMs?: number
+	/** Rescue script run when the handshake times out (session-scoped CDP load). */
+	bootstrapScript?: string
 }
 
 export const Config: z<Config> = z.object({
@@ -57,6 +87,15 @@ export const Config: z<Config> = z.object({
 	port: z.number().step(1).min(1024).max(65_535).default(9777),
 	token: z.string().default('dsh-local'),
 	shotsDir: z.string().default('dsh-browser-shots'),
+	launch: z.object({
+		enabled: z.boolean().default(false),
+		chromePath: z.string().default(''),
+		profileDir: z.string().default(''),
+		urls: z.array(z.string()).default([]),
+		extraArgs: z.array(z.string()).default([]),
+		waitMs: z.number().step(1).min(1_000).max(120_000).default(25_000),
+		bootstrapScript: z.string().default(''),
+	}),
 })
 
 interface ResolvedConfig {
@@ -64,6 +103,33 @@ interface ResolvedConfig {
 	port: number
 	token: string
 	shotsDir: string
+	launch: ResolvedLaunchConfig
+}
+
+/**
+ * Apply `launch` defaults defensively. The nested schema already carries them,
+ * but resolving here keeps the controller correct on dsh-settings builds that
+ * hand back a partially populated section, and on `apply()`'s raw config.
+ * @param config - raw or settings-resolved plugin config.
+ * @returns the same config with every field materialized.
+ */
+function resolveConfig(config: Config): ResolvedConfig {
+	const launch = config.launch ?? {}
+	return {
+		enabled: config.enabled ?? true,
+		port: config.port ?? 9777,
+		token: config.token ?? 'dsh-local',
+		shotsDir: config.shotsDir ?? 'dsh-browser-shots',
+		launch: {
+			enabled: launch.enabled ?? false,
+			chromePath: launch.chromePath ?? '',
+			profileDir: launch.profileDir ?? '',
+			urls: [...(launch.urls ?? [])],
+			extraArgs: [...(launch.extraArgs ?? [])],
+			waitMs: launch.waitMs ?? 25_000,
+			bootstrapScript: launch.bootstrapScript ?? '',
+		},
+	}
 }
 
 const SNAPSHOT_REF_SELECTOR_PATTERN = /^e\d+$/
@@ -80,8 +146,20 @@ class BridgeController {
 	private lastError: string | undefined
 	private chain: Promise<void> = Promise.resolve()
 	private current: ResolvedConfig | undefined
+	/**
+	 * Brings the dedicated browser environment up when a call finds the bridge
+	 * without a link. It reads the latest settings on every attempt, so flipping
+	 * `launch` in dsh settings applies to the next tool call without a restart.
+	 */
+	private readonly launcher: BrowserLauncher
 
-	constructor(private readonly log: (line: string) => void) {}
+	constructor(private readonly log: (line: string) => void) {
+		this.launcher = new BrowserLauncher({
+			readConfig: () => this.current?.launch,
+			isConnected: () => this.server?.status.extensionConnected ?? false,
+			log,
+		})
+	}
 
 	/** Resolved directory screenshots land in; defined once any config arrived. */
 	get shotsDir(): string | undefined {
@@ -148,6 +226,9 @@ class BridgeController {
 				this.lastError ?? '浏览器控制未启用 —— 到 dsh 设置 → 插件 → DSH 浏览器控制 打开开关',
 			)
 		}
+		// One hook covers every browser_* tool: with `launch` configured, a cold
+		// start brings the dedicated environment up instead of failing outright.
+		if (!server.status.extensionConnected) await this.launcher.ensureConnected()
 		return server.execute(command, params, { signal })
 	}
 
@@ -838,7 +919,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 
 /** Cordis plugin entry: wire the settings-driven lifecycle plus the model-facing tools. */
 export function apply(ctx: Context, config: Config): void {
-	const resolved = config as Required<Config>
+	const resolved = resolveConfig(config)
 	if (resolved.enabled && resolved.token.trim().length === 0) {
 		throw new Error('browser-bridge: token must be a non-empty string when enabled')
 	}
@@ -866,7 +947,7 @@ export function apply(ctx: Context, config: Config): void {
 				},
 			},
 		)
-		current = () => scope.get() as ResolvedConfig
+		current = () => resolveConfig(scope.get())
 		ctx.effect(() => () => {
 			// Mirror `isUnloading` from dsh-settings (private): the fiber's own
 			// unload path runs the disposer too, and there re-applying the

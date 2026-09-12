@@ -1,5 +1,20 @@
 # 更新日志
 
+## v1.0.8 (2026-09-12)
+
+- 新增：**一键安装 + 安装自检**。
+  - `scripts/install.ps1`：幂等完成「把插件装进 profile → 在 profile 用户层补丁写 `browser-bridge` 配置（含 `launch`）→ 生成「浏览器操作」模式 → 启动专属浏览器并打开 `chrome://extensions`」。补丁层是 `patchReload: live`，**改完不用重启 dsh**；也不覆盖用户的 `settings.yaml`。
+  - `scripts/verify-install.ps1`：通过桥的 HTTP 面 `POST /api/command` 下发真实命令逐项验收 —— 桥在监听 / 扩展已连接 / 扩展版本 = 仓库版本 / `ping` / `tabs.list` / `eval` 里 `await` 400ms / 读当前页 / 模式与 `launch` 配置就位。
+  - `scripts/start-browser.ps1` + `.cmd`：手动启动专属浏览器；`scripts/bootstrap-extension.ps1`：会话级 CDP 兜底装载；`scripts/reload-extension.ps1`：改过扩展代码后清 Service Worker 脚本缓存。
+  - [`AGENTS.md`](AGENTS.md)：给 AI Agent 的安装 runbook —— 用户把仓库地址丢给 Agent，Agent 负责安装、把「开发者模式 + 加载已解压」那段发给用户、用户做完后跑自检并用自己的 `browser_*` 工具做一轮真实验证。
+- 新增：`launch` 配置段 —— **专属浏览器环境自动拉起**。`browser_*` 调用发现桥上没有扩展连接时，插件按 `launch.profileDir` 拉起一个独立的 Chrome user-data-dir（`chromePath` 留空则按平台自动探测），并轮询等待扩展握手（`waitMs`，默认 25s）。这样 dsh 的调试器不会再去挤日常 Chrome —— 同一标签页只允许一个 debugger 客户端，Claude / ChatGPT / 录屏类扩展都在抢它，表现就是 `Cannot access a chrome-extension:// URL of different extension` 和随机掉线。
+  - 合并并发：多个工具调用只会触发一次拉起；失败后 5s 内不重复 fork，避免每次调用都弹一个 Chrome。
+  - `bootstrapScript`：握手超时后运行一次引导脚本（用 CDP `Extensions.loadUnpacked` 把未打包扩展装进该 profile）。Chrome 137+ 已移除 `--load-extension`，这是官方替代路径。
+  - 不配 `launch`（或 `enabled: false`）时行为与之前完全一致，不会拉起任何东西。
+- 修复（扩展）：`Runtime.evaluate` 的超时默认值。原来没传 `timeoutMs` 时 `Math.max(100, 0)` 会算出 **100ms**，导致任何超过 0.1 秒的求值（fetch、多步读取、await）都报 `eval timeout after 100ms` —— 与注释里写的「不传就走桥接的 60s 默认」不一致。现在不传即不设竞速计时器。
+- 修复（扩展）：`chrome.debugger.onDetach` 原来是个空处理器，调试器被 DevTools / 其它扩展抢走或目标崩溃后，`attachedTabs` 仍以为自己挂着，之后该标签页每条命令都报 `Debugger is not attached to the tab with id: N`。现在 detach 即清除记录；`withCDP` 再对这类错误**重挂一次并重试**。
+- 文档：`dsh-config/README.md` 补充 `launch` 段字段说明与专属环境搭建步骤。
+
 ## v1.0.7 (2026-09-04)
 
 - 新增：`browser_console_log` — 抓取页面 console.log/info/warn/error/debug；可按 level + regex 过滤，可 `clear:true` 清空。CDP 域 `Runtime.enable` 已在 attach 时常驻，不再 lazy。
