@@ -13,6 +13,9 @@
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -ProfileDir D:\dsh-browser-profile
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -SkipPreset -SkipLaunch
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UseCli     # 改用 dsh plugin add 安装
+    powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -ProfileName desktop -DisableLaunch
+                                                            # 第二个 profile：只挂插件，不自动拉起浏览器
+                                                            # （桥端口单实例，两个 profile 同时跑会启动失败）
 
   装完请让用户完成部署（开发者模式 + 加载已解压的扩展程序），再跑 verify-install.ps1。
 #>
@@ -30,7 +33,8 @@ param(
   [switch]$SkipPreset,
   [switch]$SkipLaunch,
   [switch]$UseCli,
-  [switch]$SessionLoad
+  [switch]$SessionLoad,
+  [switch]$DisableLaunch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -129,12 +133,21 @@ if ($UseCli) {
 }
 
 # profile 的 package.json：登记依赖 + bundle
+#
+# 依赖一律写成指向本仓库的 `link:`，不要写 `^<版本>`：这个包在 npm 上可能还没发到
+# 仓库里的版本（实测 registry 只有 1.0.7，而仓库是 1.0.8），而 Desktop 应用启动时会
+# 用它自带的 pnpm 对当前 profile 做一次依赖材质化 —— 一旦版本在 registry 上不存在，
+# 那一步会失败，整个 profile **进不去**（报 Profile dependency migration failed）。
+# link: 只写进 lockfile、不查 registry，版本永远等于仓库里这份。
+$depSpec = 'link:' + ($RepoDir -replace '\\', '/')
 $profilePkgPath = Join-Path $profilePath 'package.json'
 $profilePkg = Get-Content $profilePkgPath -Raw | ConvertFrom-Json
 $changed = $false
 if (-not $profilePkg.dependencies) { $profilePkg | Add-Member -NotePropertyName dependencies -NotePropertyValue ([pscustomobject]@{}) -Force; $changed = $true }
-if (-not $profilePkg.dependencies.PSObject.Properties['@caob23/dsh-browser-control']) {
-  $profilePkg.dependencies | Add-Member -NotePropertyName '@caob23/dsh-browser-control' -NotePropertyValue "^$($repoPkg.version)" -Force
+$depProp = $profilePkg.dependencies.PSObject.Properties['@caob23/dsh-browser-control']
+$depValue = if ($depProp) { $depProp.Value } else { $null }
+if ($null -eq $depValue -or ($depValue -is [string] -and $depValue -notlike 'link:*')) {
+  $profilePkg.dependencies | Add-Member -NotePropertyName '@caob23/dsh-browser-control' -NotePropertyValue $depSpec -Force
   $changed = $true
 }
 if (-not $profilePkg.dsh) { $profilePkg | Add-Member -NotePropertyName dsh -NotePropertyValue ([pscustomobject]@{}) -Force; $changed = $true }
@@ -163,20 +176,46 @@ $urlLines = ''
 foreach ($u in $LaunchUrls) { $urlLines += "`n            - '$u'" }
 if (-not $urlLines) { $urlLines = ' []' }
 
+# -DisableLaunch：把这一层算作「第二个 profile」。桥固定占 127.0.0.1:<Port>，
+# 而插件在 enabled 时用 reconcile(..., { throwOnError: true })，端口冲突会把整个
+# profile 的 boot 抛崩。所以同一台机器上只让一个 profile 负责自动拉起浏览器，
+# 另一个（例如 Desktop 默认的 desktop profile）只挂插件、不 launch。
+if ($DisableLaunch) {
+  $launchBlock = @"
+    launch:
+      enabled: false
+      chromePath: '$chrome'
+      profileDir: '$ProfileDir'
+      urls: []
+      waitMs: 25000
+"@
+} else {
+  $launchBlock = @"
+    launch:
+      enabled: true
+      chromePath: '$chrome'
+      profileDir: '$ProfileDir'
+      urls:$urlLines
+      waitMs: 25000
+"@
+}
+
+# here-string 会带上结尾换行，去掉它，保证「结束标记」永远独立成行（否则会粘成
+# `waitMs: 25000# <<< ...`，这行就不再是合法注释）
+$launchBlock = $launchBlock.TrimEnd("`r", "`n")
+
+# 补丁层的一条 patch 就是「一个 id + 要覆盖的字段」（cordis-plugin-include 的
+# PatchOptions）：id 选行，其余键按字面写进那一行。不要再套一层 `- merge:`，
+# 那会让整条 patch 变成没有 id 的未知键、被静默忽略（桥就永远起不来）。
 $block = @"
 $markerStart
-- merge:
-    - id: browser-bridge
-      config:
-        enabled: true
-        port: $Port
-        token: $Token
-        launch:
-          enabled: true
-          chromePath: '$chrome'
-          profileDir: '$ProfileDir'
-          urls:$urlLines
-          waitMs: 25000
+- id: browser-bridge
+  name: '@caob23/dsh-browser-control'
+  config:
+    enabled: true
+    port: $Port
+    token: $Token
+$launchBlock
 $markerEnd
 "@
 
