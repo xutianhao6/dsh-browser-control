@@ -31,8 +31,9 @@ Forked from [caob23/dsh-browser-control](https://github.com/caob23/dsh-browser-c
 
 | Change | What it does |
 |---|---|
-| **One-command install + self-check** | `scripts/install.ps1` idempotently installs the plugin, writes the config, generates the mode and starts the browser; `scripts/verify-install.ps1` drives real commands through the bridge's HTTP face and checks them one by one. [`AGENTS.md`](AGENTS.md) is a runbook for AI agents — the user can just hand the repo URL to their agent. |
+| **One-command install + self-check** | `scripts/install.ps1` idempotently installs the plugin, writes the config, generates the mode and starts the browser; `scripts/verify-install.ps1` drives real commands through the bridge's HTTP face and checks them one by one. [`AGENTS.md`](AGENTS.md) is a runbook for AI agents — the user can just hand the repo URL to their agent. Re-running is safe: with a `link:<repo>` dependency, `node_modules\@caob23\dsh-browser-control` is a junction into the repo, which the script now detects and skips (otherwise `Copy-Item` aborts with "used by another process"). |
 | **Dedicated browser environment + auto-launch** | New `launch` config. When a `browser_*` call finds no extension connected, the plugin starts a Chrome with its own `user-data-dir`, waits for the handshake, then runs the original command. Chrome allows one debugger client per tab, so extensions in your daily profile that also request `debugger` (Claude, ChatGPT, screen recorders) steal it — the symptom is `Cannot access a chrome-extension:// URL of different extension` plus random disconnects. See [Dedicated browser environment](#dedicated-browser-environment-v108). |
+| **The persona no longer lies about launching** | `scripts/assets/persona.yml` used to say, unconditionally, "when a tool reports no extension connected, the plugin starts the browser itself" — but a profile installed with `-DisableLaunch` has `launch.enabled: false` and never launches anything, so the model waited for a launch that could not happen and then went digging through the app bundle for a start command. `install.ps1` now generates one of two wordings from `$DisableLaunch`, and **both** carry the fallback command (absolute path to `scripts\start-browser.ps1`), the bridge status page, and the "`chrome://` pages cannot be debugged" warning. |
 | **"Browser operations" mode** | A DSH agent preset: selecting it tells the model to drive the browser with the `browser_*` tools and follow a fixed workflow. See [Browser operations mode](#browser-operations-mode-agent-preset). |
 | **Fixed the hidden 100 ms `Runtime.evaluate` timeout** | With no caller-supplied `timeoutMs`, `Math.max(100, Number(x) \|\| 0)` collapsed the budget to **100 ms**, so any evaluation slower than a tenth of a second (in-page fetch, multi-step read, `await`) failed with `eval timeout after 100ms` — the opposite of the documented 60 s bridge default. |
 | **Fixed stale debugger state after a detach** | `chrome.debugger.onDetach` was a no-op, so after DevTools or another extension took the tab (or the target crashed), the in-memory `attachedTabs` still claimed the tab and every later command failed with `Debugger is not attached to the tab with id: N`. Detach now drops the record, and `withCDP` re-attaches once and retries. |
@@ -88,7 +89,7 @@ git clone https://github.com/<you>/dsh-browser-control.git
 powershell -ExecutionPolicy Bypass -File dsh-browser-control\scripts\install.ps1
 ```
 
-The script installs the plugin into dsh's `web` profile, writes the `browser-bridge` config (including the [dedicated browser environment](#dedicated-browser-environment-v108); the patch layer hot-reloads, so **no dsh restart**), generates the ["Browser operations" mode](#browser-operations-mode-agent-preset), and starts the dedicated browser on `chrome://extensions`.
+The script installs the plugin into dsh's `web` profile, writes the `browser-bridge` config (including the [dedicated browser environment](#dedicated-browser-environment-v108)), generates the ["Browser operations" mode](#browser-operations-mode-agent-preset) (its persona is generated from the `launch` config), and starts the dedicated browser on `chrome://extensions`.
 
 Then do the **one manual step**: in that window open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and pick the repository's `extension` directory. Afterwards run:
 
@@ -236,6 +237,12 @@ browser-bridge:
 
 Behaviour: any `browser_*` tool that finds no connection → launch `profileDir` → poll for the handshake → (only on timeout) run `bootstrapScript` → run the original command. Concurrent calls share one launch, and a failed attempt does not re-spawn for 5 seconds, so a tool call never forks a browser per call.
 
+### Edited the `launch` config and nothing happened? (measured 2026-09-13)
+
+The patch layer declares `patchReload: live`, but **changing only `launch.*` did not reach the running plugin** in testing: after flipping `launch.enabled` from `false` to `true`, tool calls still refused to launch a browser, `/api/status` stayed at `extensionConnected: false`, and the dsh log showed no `browser-bridge: 没有扩展连接，拉起专属浏览器 …` line at all. **One dsh restart fixed it immediately.**
+
+There is exactly one way to tell: with `launch.enabled: true` and no extension connected, a `browser_*` call **must** leave that "拉起专属浏览器 `<profileDir>`" line in the dsh log. **No line means the config never reached the plugin** — do not go suspecting the extension. The log lives at `%APPDATA%\DSH Desktop\logs\host\dsh-<date>.log`.
+
 ### Setting it up
 
 1. **Load the extension inside the dedicated window (the only durable way)**: start Chrome with that profile, open `chrome://extensions`, turn on **Developer mode**, then "Load unpacked" → pick the extension directory. Chrome only persists unpacked extensions while developer mode is on; afterwards every start of that profile carries it automatically.
@@ -248,7 +255,7 @@ Behaviour: any `browser_*` tool that finds no connection → launch `profileDir`
 1. dsh Settings → Plugins → DSH Browser Control → enable
 2. The extension connects automatically (port 9777, default token dsh-local)
 3. Talk in natural language; the agent drives the browser — pick the "Browser operations" mode below when you want it to *know* this task is about the browser
-4. The plugin starts the dedicated environment itself when nothing is connected (see above), so you never open it by hand
+4. With `launch.enabled: true` the plugin starts the dedicated environment itself when nothing is connected (see above), so you never open it by hand; a profile installed with `-DisableLaunch` never auto-launches — run `scripts\start-browser.ps1` once instead
 
 Visit `http://127.0.0.1:9777/` for connection status.
 

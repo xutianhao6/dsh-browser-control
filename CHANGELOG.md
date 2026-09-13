@@ -3,7 +3,7 @@
 ## v1.0.8 (2026-09-12)
 
 - 新增：**一键安装 + 安装自检**。
-  - `scripts/install.ps1`：幂等完成「把插件装进 profile → 在 profile 用户层补丁写 `browser-bridge` 配置（含 `launch`）→ 生成「浏览器操作」模式 → 启动专属浏览器并打开 `chrome://extensions`」。补丁层是 `patchReload: live`，**改完不用重启 dsh**；也不覆盖用户的 `settings.yaml`。
+  - `scripts/install.ps1`：幂等完成「把插件装进 profile → 在 profile 用户层补丁写 `browser-bridge` 配置（含 `launch`）→ 生成「浏览器操作」模式 → 启动专属浏览器并打开 `chrome://extensions`」。补丁层是 `patchReload: live`，通常改完不用重启 dsh（实测例外：只改 `launch.*` 时未必重组进插件，见本版末尾两条修正）；也不覆盖用户的 `settings.yaml`。
   - `scripts/verify-install.ps1`：通过桥的 HTTP 面 `POST /api/command` 下发真实命令逐项验收 —— 桥在监听 / 扩展已连接 / 扩展版本 = 仓库版本 / `ping` / `tabs.list` / `eval` 里 `await` 400ms / 读当前页 / 模式与 `launch` 配置就位。
   - `scripts/start-browser.ps1` + `.cmd`：手动启动专属浏览器；`scripts/bootstrap-extension.ps1`：会话级 CDP 兜底装载；`scripts/reload-extension.ps1`：改过扩展代码后清 Service Worker 脚本缓存。
   - [`AGENTS.md`](AGENTS.md)：给 AI Agent 的安装 runbook —— 用户把仓库地址丢给 Agent，Agent 负责安装、把「开发者模式 + 加载已解压」那段发给用户、用户做完后跑自检并用自己的 `browser_*` 工具做一轮真实验证。
@@ -13,7 +13,10 @@
   - 不配 `launch`（或 `enabled: false`）时行为与之前完全一致，不会拉起任何东西。
 - 修复（扩展）：`Runtime.evaluate` 的超时默认值。原来没传 `timeoutMs` 时 `Math.max(100, 0)` 会算出 **100ms**，导致任何超过 0.1 秒的求值（fetch、多步读取、await）都报 `eval timeout after 100ms` —— 与注释里写的「不传就走桥接的 60s 默认」不一致。现在不传即不设竞速计时器。
 - 修复（扩展）：`chrome.debugger.onDetach` 原来是个空处理器，调试器被 DevTools / 其它扩展抢走或目标崩溃后，`attachedTabs` 仍以为自己挂着，之后该标签页每条命令都报 `Debugger is not attached to the tab with id: N`。现在 detach 即清除记录；`withCDP` 再对这类错误**重挂一次并重试**。
+- 修复（`install.ps1`）：**重复运行会在第 1 步中断**（`Copy-Item : The process cannot access the file ...\lib\index.js because it is being used by another process`）。profile 的依赖写成 `link:<repo>` 时，`node_modules\@caob23\dsh-browser-control` 是指向本仓库的 junction，往里复制等于把仓库拷给自己，而 dsh 正加载着 `lib/index.js`。现在检测到 reparse point 且目标就是本仓库就跳过复制并打印原因；真实目录（脚本自己复制出来的）仍照旧刷新，`git pull` 后再跑一次照样生效。顺带把 `$DshHome\profiles\node_modules\...\dsh-agent-presets` 加进 standard 组装的查找路径（Desktop 安装里就在这儿，之前只找 npx 缓存，找不到就会静默跳过模式生成、留下旧人设）。
 - 文档：`dsh-config/README.md` 补充 `launch` 段字段说明与专属环境搭建步骤。
+- 修复：**「浏览器操作」模式的人设会谎报拉起行为**。`scripts/assets/persona.yml` 里原来无条件写着「工具报没有扩展连接时，插件会自动把它拉起来」，可用 `-DisableLaunch` 装的 profile 写的是 `launch.enabled: false` —— 插件根本不会拉起，模型于是卡在一个不会发生的等待上，最后自己去翻 Electron 的 `app.asar` 找启动方式（真实踩到：约 14 次工具调用里只有 3~4 次是必要的）。现在 `install.ps1` 按 `$DisableLaunch` 生成两种说法（开着时说会自动拉起、并给出「连着两次同一条错就是没生效」的判据；关着时说浏览器没开就跑脚本），两种都带上兜底命令的绝对路径（`{{REPO_DIR}}\scripts\start-browser.ps1`）、桥状态页和「`chrome://` 页面不能挂调试器」。占位符替换漏了会打 `[!]` 警告。
+- 文档：**更正「补丁层改完不用重启 dsh」的说法**。实测（2026-09-13）只改 `launch.*` 时，运行中的 dsh 没有把它重组进插件配置：`enabled: false → true` 之后工具调用仍不拉起浏览器，`/api/status` 一直未连接，日志里连「拉起专属浏览器」那行都没有，**重启一次 dsh 即恢复正常**。`install.ps1` 的收尾提示、README / README.en 的「改了 launch 配置没生效？」一节、AGENTS.md 的故障表都按实测改了，并给出唯一判据：`launch.enabled: true` 且未连接时日志必然出现那行，没有就是配置没进到插件里。
 
 ## v1.0.7 (2026-09-04)
 

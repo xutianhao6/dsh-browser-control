@@ -4,8 +4,10 @@
   做四件事：
     1. 把本仓库的插件包装进 dsh 的 web profile（node_modules + profile package.json）
     2. 在 profile 的用户层补丁里写 browser-bridge 配置（含 launch 专属浏览器环境）
-       —— 该文件是 patchReload: live，改完不用重启 dsh
-    3. 生成「浏览器操作」Agent preset（复制 dsh 随附的 standard 组装 + 换成浏览器人设）
+       —— 该层声明了 patchReload: live；但实测只改 launch.* 时运行中的 dsh 未必把它
+          重组进插件配置，改了没生效就重启一次 dsh
+    3. 生成「浏览器操作」Agent preset（复制 dsh 随附的 standard 组装 + 换成浏览器人设；
+       人设里那句「插件会自动把它拉起来」按 launch 配置生成，-DisableLaunch 时不会出现）
     4. 启动专属浏览器并打开 chrome://extensions，打印需要用户手动做的部署步骤
 
   用法：
@@ -122,14 +124,29 @@ if ($UseCli) {
   if ($LASTEXITCODE -ne 0) { throw "dsh plugin add 失败（退出码 $LASTEXITCODE）" }
   Ok "通过 dsh plugin 安装完成"
 } else {
-  New-Item -ItemType Directory -Force -Path $pkgTarget | Out-Null
-  foreach ($item in @('lib', 'package.json', 'cordis.patch.yml', 'README.md', 'README.en.md', 'llms.txt', 'LICENSE')) {
-    $src = Join-Path $RepoDir $item
-    if (-not (Test-Path $src)) { continue }
-    if ((Get-Item $src).PSIsContainer) { Copy-Item $src $pkgTarget -Recurse -Force }
-    else { Copy-Item $src $pkgTarget -Force }
+  # profile 的依赖写成 link:<本仓库> 时，dsh/pnpm 会把 node_modules\@caob23\dsh-browser-control
+  # 物化成指向本仓库的 junction —— 再往里 Copy-Item 等于把仓库拷给自己，而且 dsh 正加载着
+  # lib\index.js，只会报「文件被另一个进程占用」。这种链接直接跳过复制（文件本来就是最新的）；
+  # 不是链接时（install.ps1 之前复制的真实目录）照旧复制，这样 `git pull` 后再跑一次能刷新。
+  $pkgItem = Get-Item $pkgTarget -Force -ErrorAction SilentlyContinue
+  $skipCopy = $false
+  if ($pkgItem -and ($pkgItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+    $linkTarget = @($pkgItem.Target) | Where-Object { $_ } | Select-Object -First 1
+    $resolved = if ($linkTarget) { (Resolve-Path $linkTarget -ErrorAction SilentlyContinue).Path } else { $null }
+    # 取不到目标也按链接处理：往链接里复制本来就不可能成功
+    $skipCopy = (-not $resolved) -or ($resolved.TrimEnd('\') -ieq $RepoDir.TrimEnd('\'))
+    if ($skipCopy) { Ok "$pkgTarget 是指向本仓库的链接，跳过复制" }
   }
-  Ok "已复制到 $pkgTarget"
+  if (-not $skipCopy) {
+    New-Item -ItemType Directory -Force -Path $pkgTarget | Out-Null
+    foreach ($item in @('lib', 'package.json', 'cordis.patch.yml', 'README.md', 'README.en.md', 'llms.txt', 'LICENSE')) {
+      $src = Join-Path $RepoDir $item
+      if (-not (Test-Path $src)) { continue }
+      if ((Get-Item $src).PSIsContainer) { Copy-Item $src $pkgTarget -Recurse -Force }
+      else { Copy-Item $src $pkgTarget -Force }
+    }
+    Ok "已复制到 $pkgTarget"
+  }
 }
 
 # profile 的 package.json：登记依赖 + bundle
@@ -228,7 +245,8 @@ if ($body.Trim().Length -gt 0 -and -not $body.EndsWith("`n")) { $body += "`n" }
 $newPatch = ($body.TrimEnd() + "`n`n" + $block).TrimStart("`n")
 Write-Text $patchPath $newPatch
 Ok "写入 $patchPath"
-Info "该层是 patchReload: live —— dsh 会热重组，不需要重启"
+Info "该层声明了 patchReload: live，但实测只改 launch.* 时运行中的 dsh 未必重组进插件配置"
+Info "（enabled: false -> true 后工具调用仍不拉起，日志里没有「拉起专属浏览器」那行）—— 没生效就重启一次 dsh"
 
 # ───────────────────────────────────────────── 3. 生成浏览器操作 preset
 
@@ -240,6 +258,7 @@ if ($SkipPreset) {
   $shipped = $null
   $globs = @(
     (Join-Path $profilePath 'node_modules\@deepseek-ai\dsh-agent-presets\presets\standard\agent.cordis.yml'),
+    (Join-Path $DshHome 'profiles\node_modules\@deepseek-ai\dsh-agent-presets\presets\standard\agent.cordis.yml'),
     (Join-Path $env:LOCALAPPDATA 'npm-cache\_npx\*\node_modules\@deepseek-ai\dsh-agent-presets\presets\standard\agent.cordis.yml'),
     (Join-Path $env:APPDATA 'npm\node_modules\@deepseek-ai\dsh-agent-presets\presets\standard\agent.cordis.yml')
   )
@@ -261,6 +280,24 @@ if ($SkipPreset) {
     $start = 0
     while ($start -lt $personaLines.Count -and ($personaLines[$start].Trim() -eq '' -or $personaLines[$start].TrimStart().StartsWith('#'))) { $start++ }
     $persona = ($personaLines[$start..($personaLines.Count - 1)] -join "`n").TrimEnd()
+
+    # 人设里的兜底路径随仓库位置变；拉起那句话随 launch 配置变 —— 用 -DisableLaunch 装时
+    # 补丁层写的是 launch.enabled: false，插件根本不会拉起浏览器，人设就不能说它会自动拉起
+    # （否则模型会一直等一个不会发生的拉起，然后自己去翻应用包体找启动方式）。
+    $launchTail = @(
+      '        powershell -NoProfile -ExecutionPolicy Bypass -File "{{REPO_DIR}}\scripts\start-browser.ps1"'
+      '        拉起来后用 browser_tabs 确认。仍然连不上（扩展没装或被停用），才把「在专属窗口里 chrome://extensions → 开发者模式 → 加载已解压的扩展程序」这一步交还用户。桥的状态页 http://127.0.0.1:{{PORT}}/api/status（看 extensionConnected）能一眼判断扩展在不在线；故障排查见 "{{REPO_DIR}}\AGENTS.md" 的「常见故障」。'
+    ) -join "`n"
+    $launchHead = if ($DisableLaunch) {
+      '- 浏览器是一个专属环境（独立 profile，只装了 DSH Browser Control 扩展），与用户日常浏览器隔离。**这个 profile 装的时候带了 -DisableLaunch，插件不会自动拉起浏览器**（桥端口是单实例，同一台机器只让一个 profile 负责拉起）：工具报"没有扩展连接"就是浏览器没开，不要问用户，自己跑：'
+    } else {
+      '- 浏览器是一个专属环境（独立 profile，只装了 DSH Browser Control 扩展），与用户日常浏览器隔离。工具报"没有扩展连接"时，插件会自动把它拉起来（那次调用最多等约 25 秒，所以比平时慢是正常的）；**连着两次都是同一条错**就说明自动拉起没生效（launch.enabled 被关掉、没热生效，或扩展没装/被停用），这时不要问用户，自己跑：'
+    }
+    $persona = $persona.Replace('{{LAUNCH_BULLET}}', ($launchHead + "`n" + $launchTail)).Replace('{{REPO_DIR}}', $RepoDir).Replace('{{PORT}}', "$Port")
+    # 只查本脚本负责的三个占位符：{{model}} / {{cwd}} 是 dsh 自己的模板变量，必须原样留着
+    $leftover = @('{{LAUNCH_BULLET}}', '{{REPO_DIR}}', '{{PORT}}') | Where-Object { $persona.Contains($_) }
+    if ($leftover) { Warn "人设里还有没替换掉的占位符（$($leftover -join '、')）—— 检查 assets\persona.yml" }
+
     $composition = Get-Content (Join-Path $presetDir 'agent.cordis.yml') -Raw
     $pattern = '(?ms)^- id: persona\r?\n.*?(?=^- id: )'
     if ([regex]::IsMatch($composition, $pattern)) {

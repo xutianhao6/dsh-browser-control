@@ -69,12 +69,23 @@ powershell -ExecutionPolicy Bypass -File <仓库目录>\scripts\verify-install.p
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
+| `no browser extension connected`，但扩展明明装过 | 这个 profile 是 `-DisableLaunch` 装的（`launch.enabled: false`），或改了 `launch` 没进到运行中的插件里 | **先自己跑** `scripts\start-browser.ps1` 把专属环境拉起来，再复跑原命令；确认补丁层里 `launch.enabled: true`；改了配置仍不自动拉起就**重启一次 dsh**（实测 `patchReload: live` 未必把 `launch.*` 重组进插件） |
 | `no browser extension connected` | 用户还没做第 2 步，或扩展被停用 | 让用户按第 2 步操作；确认扩展开关是开的 |
 | `Cannot access a chrome-extension:// URL of different extension` | 同一个标签页有别的扩展在抢 `debugger`（Claude / ChatGPT / 录屏类） | 让用户在**日常** Chrome 里停用本扩展，只留专属环境里那一个 |
 | `Debugger is not attached to the tab with id: N` | 调试器被抢走后扩展的内存状态过期 | 关掉专属浏览器重开；v1.0.8 起扩展会自愈 |
 | 自检里「扩展版本 ≠ 仓库版本」 | Chrome 在用 Service Worker 缓存的旧脚本 | 跑 `scripts\reload-extension.ps1`，或在扩展页点一次「刷新」 |
 | 桥连不上（`/api/status` 打不开） | dsh 没在运行，或插件没启用 | 启动 dsh；设置 → 插件 → DSH 浏览器控制 开启 |
 | `profiles/web` 不存在 | dsh 还没初始化该 profile | 先跑一次 `dsh --profile web` |
+
+**一条判断规则（省掉一半排查）**：`launch.enabled: true` 且扩展未连接时，任何 `browser_*` 调用**必然**在 dsh 日志里留下
+
+```
+[browser-bridge] browser-bridge: 没有扩展连接，拉起专属浏览器 <profileDir>
+```
+
+**日志里没有这行，就是配置没进到插件里**（去重启 dsh），不要往「扩展是不是没装」「profile 是不是错了」的方向查。日志：`%APPDATA%\DSH Desktop\logs\host\dsh-<日期>.log`。
+
+同理，**别把「浏览器没开」交还给用户**：专属环境是由脚本拉起的（`scripts\start-browser.ps1`，`launch.enabled: true` 时插件自己也会拉），你手上就有这条命令。「浏览器操作」模式的人设里已经写明这一点（含本仓库的绝对路径），照着做即可；只有「扩展没装 / 被停用」才轮到用户去点那三下。
 
 ## 6. 不要做
 

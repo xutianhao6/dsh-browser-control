@@ -31,8 +31,9 @@ fork 自 [caob23/dsh-browser-control](https://github.com/caob23/dsh-browser-cont
 
 | 改动 | 说明 |
 |---|---|
-| **一键安装 + 自检** | `scripts/install.ps1` 幂等完成「装插件 + 写配置 + 生成模式 + 启动浏览器」，`scripts/verify-install.ps1` 通过桥的 HTTP 面下发真实命令逐项验收；[`AGENTS.md`](AGENTS.md) 是给 AI Agent 的 runbook —— 用户把仓库地址丢给 Agent 就能装好 |
+| **一键安装 + 自检** | `scripts/install.ps1` 幂等完成「装插件 + 写配置 + 生成模式 + 启动浏览器」，`scripts/verify-install.ps1` 通过桥的 HTTP 面下发真实命令逐项验收；[`AGENTS.md`](AGENTS.md) 是给 AI Agent 的 runbook —— 用户把仓库地址丢给 Agent 就能装好。重复运行也安全：profile 依赖是 `link:<仓库>` 时 `node_modules\@caob23\dsh-browser-control` 是指向本仓库的 junction，脚本会识别并跳过复制（否则 `Copy-Item` 会报「文件被另一个进程占用」而中断）。 |
 | **专属浏览器环境 + 自动拉起** | 新增 `launch` 配置段：任一 `browser_*` 调用发现桥上没有扩展连接时，插件自动拉起一个独立 `user-data-dir` 的 Chrome，等它握手后再执行原命令。Chrome 同一个标签页只允许一个 `debugger` 客户端，日常 profile 里的 Claude / ChatGPT / 录屏类扩展会把它抢走，表现就是 `Cannot access a chrome-extension:// URL of different extension` 和随机掉线 —— 独立环境根治这一点。详见[专属浏览器环境](#专属浏览器环境v108)。 |
+| **人设不再谎报拉起行为** | `scripts/assets/persona.yml` 里原来固定写着「工具报没有扩展连接时，插件会自动把它拉起来」—— 可用 `-DisableLaunch` 装的 profile 是 `launch.enabled: false`，插件根本不会拉起：模型于是卡在一个不会发生的等待上，最后自己去翻应用包体找启动方式。现在 `install.ps1` 按 `$DisableLaunch` 生成两种说法，**两种都**带上兜底命令（`scripts\start-browser.ps1` 的绝对路径）、桥状态页和「`chrome://` 页面不能挂调试器」的提醒。 |
 | **「浏览器操作」模式** | 一个 DSH Agent preset：选中它，模型就知道该用 `browser_*` 工具去驱动浏览器，并遵守固定的操作顺序。详见[「浏览器操作」模式](#浏览器操作模式agent-preset)。 |
 | **修 `Runtime.evaluate` 隐形 100 ms 超时** | 调用方没传 `timeoutMs` 时，`Math.max(100, Number(x) \|\| 0)` 会把预算算成 **100 ms**，于是任何超过 0.1 秒的求值（页面内 fetch、多步读取、`await`）都报 `eval timeout after 100ms`，与「不传就走桥接 60 s 默认」的注释相反。现在不传即不设竞速计时器。 |
 | **修调试器掉线后不自愈** | `chrome.debugger.onDetach` 原本是空处理器：调试器被 DevTools / 其它扩展抢走或目标崩溃后，扩展内存里的 `attachedTabs` 仍以为自己挂着，之后该标签页每条命令都报 `Debugger is not attached to the tab with id: N`。现在 detach 即清除记录，`withCDP` 对该错误再重挂一次并重试。 |
@@ -88,7 +89,7 @@ git clone https://github.com/<你的用户名>/dsh-browser-control.git
 powershell -ExecutionPolicy Bypass -File dsh-browser-control\scripts\install.ps1
 ```
 
-脚本会：把插件装进 dsh 的 `web` profile → 写 `browser-bridge` 配置（含[专属浏览器环境](#专属浏览器环境v108)；补丁层热生效，**不用重启 dsh**）→ 生成[「浏览器操作」模式](#浏览器操作模式agent-preset) → 启动专属浏览器并打开 `chrome://extensions`。
+脚本会：把插件装进 dsh 的 `web` profile → 写 `browser-bridge` 配置（含[专属浏览器环境](#专属浏览器环境v108)）→ 生成[「浏览器操作」模式](#浏览器操作模式agent-preset)（人设按 `launch` 配置生成，见[「浏览器操作」模式](#浏览器操作模式agent-preset)）→ 启动专属浏览器并打开 `chrome://extensions`。
 
 然后**手动做一次**部署（全程唯一需要点的地方）：在那个窗口里打开 `chrome://extensions` → 右上角开启**开发者模式** → 「加载已解压的扩展程序」→ 选仓库里的 `extension` 目录。做完跑自检：
 
@@ -235,6 +236,12 @@ browser-bridge:
 
 行为：任一 `browser_*` 工具发现桥上没有连接 → 拉起 `profileDir` → 轮询等握手 →（超时才）跑一次 `bootstrapScript` → 继续原命令。并发调用合并成一次拉起；失败后 5 秒内不重复拉起，不会每次调用都弹一个浏览器。
 
+### 改了 `launch` 配置没生效？（实测，2026-09-13）
+
+补丁层声明了 `patchReload: live`，但**实测只改 `launch.*` 时，运行中的 dsh 不一定把它重组进插件的配置**：`launch.enabled` 从 `false` 改成 `true` 之后，工具调用仍然不拉起浏览器，`/api/status` 一直是 `extensionConnected: false`，dsh 日志里连 `browser-bridge: 没有扩展连接，拉起专属浏览器 …` 都没有。**重启一次 dsh 后立即正常**。
+
+判断方法只有一条：`launch.enabled: true` 且扩展未连接时，`browser_*` 调用**必然**在 dsh 日志里留下那行「拉起专属浏览器 `<profileDir>`」。**没有这行，就是配置没进到插件里**（别去怀疑扩展）。日志在 `%APPDATA%\DSH Desktop\logs\host\dsh-<日期>.log`。
+
 ### 搭建步骤
 
 1. **在专属窗口里装扩展（唯一持久的方式）**：用专属 profile 启动 Chrome，打开 `chrome://extensions` → 右上角开启**开发者模式** → 「加载已解压的扩展程序」→ 选扩展目录。Chrome 只在开发者模式开启时持久化未打包扩展，之后每次启动都会自动带上它。
@@ -247,7 +254,7 @@ browser-bridge:
 1. dsh 设置 → 插件 → DSH 浏览器控制 → 开启
 2. Chrome 扩展自动连接（端口 9777，Token 默认 dsh-local）
 3. 对话说自然语言，Agent 自动操控浏览器；想让它明确知道「这次要操作浏览器」，用下面的「浏览器操作」模式
-4. 浏览器没开时插件会自己拉起专属环境（见上一节），不需要你先手动开
+4. `launch.enabled: true` 时浏览器没开，插件会自己拉起专属环境（见上一节），不需要你先手动开；用 `-DisableLaunch` 装的 profile 不会自动拉起，先跑一次 `scripts\start-browser.ps1` 即可
 
 访问 `http://127.0.0.1:9777/` 查看连接状态。
 
