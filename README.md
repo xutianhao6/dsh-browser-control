@@ -321,7 +321,45 @@ order: 10
 | `browser_network_clear` | 清空抓到的请求记录（v1.0.7+） |
 | `browser_pdf` | 当前页导出 PDF（v1.0.7+） |
 | `browser_emulate` | 切设备视口（移动 / 桌面 / 自定义，v1.0.7+） |
-| `browser_cleanup` | 清理临时文件 |
+| `browser_cleanup` | 清理生成的产物：shotsDir 顶层的截图 / PDF、下面的三棵逆向产物树（`har/` / `scripts/` / `sourcemaps/`，整棵删），以及 `__` 前缀的临时文件（其它顶层子目录不动） |
+
+### 接口分析 / JS 逆向（v1.0.9）
+
+给「这个页面的接口是怎么调的、参数是怎么签的」这类问题准备的一整套工具（12 个）。全部走扩展已有的 CDP 附着，不需要装代理或证书。
+
+| 工具 | 功能 |
+|---|---|
+| `browser_cdp` | 原始 CDP 透传（`method` + `params`；可带 `tabId`，或用 `targetId` 打到 worker / OOPIF / service worker）。Network / Storage / Debugger / Fetch / Emulation / Runtime 等域一次全开，封装工具没覆盖到的都用它兜底 |
+| `browser_cookies` | Cookie 的 `get` / `set` / `delete` / `clear`，走 CDP，**包含 HttpOnly** |
+| `browser_body_policy` | 读/写后台响应体捕获策略（`off` / `xhr` 默认 / `all`）；不带 `policy` 就是只读。想在请求过去之后还能拿到 body，靠它 |
+| `browser_targets` | 列出所有可调试 target（页面 / worker / 其它顶级 target），`type` / `tabId` 可过滤；`autoAttach:true` 为该标签页开 Target auto-attach——**页面的专用 Worker 只有开了它才会被报出来**，拿到 `targetId` 就能用 `browser_cdp` 进 worker 求值 / 开 Debugger 域 / 热改代码 |
+| `browser_network_body` | 按 `requestId` 取单条响应体，或 `kind:'request'` 取 POST 请求体 |
+| `browser_network_har` | 整段会话导成 HAR 1.2（`Cookie` / `Set-Cookie` 已解析），落盘 `<shotsDir>/har/`，同时回一份请求索引；每条 entry 带 `_requestId`，可直接回灌 `browser_network_body` / `browser_network_replay` |
+| `browser_network_replay` | 在页面上下文里重放抓到的请求（带页面 cookie、同源语义一致），可改 `url` / `method` / `headers` / `body` |
+| `browser_websocket_log` | WebSocket 握手头 + 收发帧（方向 / opcode / payload） |
+| `browser_scripts` | `list` 全部已解析脚本 / `source` 取全文 / `dump` 批量落盘（+ `manifest.json`）/ `sourcemap` 把 `sourcesContent` 还原成原始源码树 |
+| `browser_debugger` | `enable` / `break` / `unbreak` / `hook`（函数调用断点，抓真实入参）/ `pause` / `resume` / `step` / `state` / `eval`（帧上求值、可改参数）/ `exceptions` |
+| `browser_intercept` | Fetch 域拦改：`enable` / `disable` / `list` / `continue`（改 url / method / headers / body）/ `fulfill`（伪造响应）/ `fail` / `body` / `auth` |
+| `browser_hook` | 页面级 fetch/XHR 记录器（`install` 可跨导航常驻 / `log` / `restore`），看到的是站点 JS 传进去的原始参数 |
+
+配套的几处改动：`browser_network_log` 的结果行现在带 `requestId` 与 `bodyCached`（`bodyCached` 只在日志行上），并新增 `includeBodies` / `bodyLimit` 直接带回还能取到的响应体；HAR 的每条 entry 带 `_requestId`，和日志行一一对应；`browser_body_policy` 把策略设成 `xhr`（默认）或 `all`，响应体就在请求结束时就自动缓存（单条 ≤ 1MB）。网络捕获新增订阅 `*ExtraInfo` 事件，所以现在能看到真实的 `Cookie` / `Authorization` / `Set-Cookie` 头 —— `requestWillBeSent` 里 Chrome 是不带这些的。
+
+**Worker 里藏着的签名逻辑**：页面的专用 Worker（含 blob worker）**不会**出现在 `chrome.debugger.getTargets()` 的列表里，`browser_targets` 也列不到 —— 先 `browser_targets {tabId, autoAttach: true}` 让 Chrome 以 `Target auto-attach` 来源把 worker 报出来，再拿 `targetId` 交给 `browser_cdp`。这条路上 `Browser.*` 与 `Target.getTargets` 两个域对扩展调试器客户端是关闭的（分别实测报 `-32601 wasn't found` 与 `-32000 Not allowed`），但 `Target.setAutoAttach` 可用，`Runtime.evaluate` / `Debugger.*` 在 worker target 上也照常可用。
+
+**典型逆向工作流**
+
+1. **抓** —— 打开目标页，`browser_network_log`（或直接 `browser_network_har`）列出接口；想省事就先 `browser_body_policy` 把策略设成 `xhr` 或 `all`，响应体在请求结束时自动留在缓存里。
+2. **看** —— 拿行里的 `requestId` 用 `browser_network_body` 看响应体 / POST 体；`browser_network_har` 导出整段会话丢进 DevTools / Charles / Fiddler 慢慢比对（entry 里的 `_requestId` 可以直接回灌 `browser_network_body` / `browser_network_replay`）。真实的请求头（`Cookie`、`Authorization`、签名头）在 `extraRequestHeaders` 里。
+3. **找** —— `browser_scripts` `list` 挑出可疑的打包产物 → `source` 看全文（或 `dump` 整个落盘）→ `sourcemap` 还原原始源码树，直接读 `sign()` / `encrypt()` 的实现。
+4. **断** —— `browser_debugger` `hook`（例如 `expression: "window.sign"`）在签名函数被调用时断下 → `state` 看调用栈 → `eval` 在帧上读（或改）真实入参。
+5. **验** —— `browser_intercept` `enable` 挂住请求 → `continue` 改参数放行，或 `fulfill` 直接伪造响应；也可以用 `browser_network_replay` 带 cookie 重放，确认参数与签名之间的关系。
+6. **收尾** —— `browser_intercept` `disable`（放行挂住的请求）、`browser_debugger` `resume` / `unbreak`、`browser_hook` `restore`。
+
+三个必须知道的坑：
+
+- **断点挂着，页面 JS 就不跑了。** 标签页停在断点上时，`browser_evaluate` / `browser_read` / `browser_click` / `browser_type` / `browser_press` / `browser_scroll` / `browser_snapshot` / `browser_navigate` / `browser_hook` 会**直接失败**并提示先 `resume`，不会把命令超时耗满；同一时刻 `browser_debugger` 的 `state` / `eval` / `step` / `resume` 照常可用。
+- **`browser_intercept` 的 hold 会真的挂住页面。** 匹配到的请求停在那里等 `continue` / `fulfill` / `fail`，页面看起来像卡死；用完记得 `disable`（它会把挂住的请求一次性放行）。
+- **产物都在 shotsDir。** 逆向产物是 `har/`、`scripts/`、`sourcemaps/` 三个子目录，`browser_cleanup` 会把它们连同 shotsDir 顶层的截图 / PDF、`__` 前缀临时文件一起删掉（整棵递归删这三棵树；其它顶层子目录不动）。
 
 ## 架构
 
@@ -352,6 +390,7 @@ Chrome 浏览器
 | 专属环境自动拉起：无连接 → 插件拉起 Chrome → 扩展握手 → 执行原命令 | ✅ |
 | 1500 ms 页面内求值（旧版必挂的 100 ms 隐形超时） | ✅ |
 | 页面内连续拉取 6 个 bundle（含 148 KB JSVMP 产物，152 ms） | ✅ |
+| 逆向能力离线深度验收 `node scripts/verify-reverse.mjs`（自带夹具，同时校验入参与返回值 schema） | ✅ |
 
 ## 更新日志
 

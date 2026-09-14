@@ -20,9 +20,11 @@
 [CmdletBinding()]
 param(
   [int]$Port = 9777,
+  [string]$Token = 'dsh-local',
   [string]$RepoDir,
   [string]$DshHome,
-  [int]$WaitSeconds = 20
+  [int]$WaitSeconds = 20,
+  [switch]$SkipAdvanced
 )
 
 $ErrorActionPreference = 'Continue'
@@ -54,7 +56,9 @@ Write-Host "DSH Browser Control 安装自检（端口 $Port）" -ForegroundColor
 
 function Invoke-Command2([string]$command, $params, [int]$timeoutSec = 60) {
   $body = @{ command = $command; params = $params } | ConvertTo-Json -Compress -Depth 8
-  return Invoke-RestMethod -Uri "$base/api/command" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec $timeoutSec
+  # /api/command 需要桥的 token（header 或 ?token=）。老桥不校验也照样接受这个 header。
+  return Invoke-RestMethod -Uri "$base/api/command" -Method Post -Body $body -ContentType 'application/json' `
+    -Headers @{ 'X-DSH-Token' = $Token } -TimeoutSec $timeoutSec
 }
 
 # ── 1. 等桥起来 ────────────────────────────────────────────────────────────
@@ -89,6 +93,18 @@ Check "扩展版本 = 仓库版本" {
 # ── 2. 真实命令往返 ────────────────────────────────────────────────────────
 Write-Host "`n[2] 端到端命令" -ForegroundColor Cyan
 
+# 验收必须落在一个 http(s) 页面上：chrome:// 页面挂不上 chrome.debugger，
+# 浏览器刚起来时活动标签页往往正是 chrome://newtab，用它测什么都会 502。
+$probeTab = $null
+
+Check "打开验收用标签页（http://127.0.0.1:$Port/）" {
+  if (-not $status -or -not $status.extensionConnected) { throw "扩展没连上，跳过" }
+  $r = Invoke-Command2 'tabs.open' @{ url = "$base/"; active = $true } 30
+  if (-not $r.ok) { throw $r.error }
+  $script:probeTab = [int]$r.result.tabId
+  "tabId=$($script:probeTab)"
+}
+
 Check "ping" {
   $r = Invoke-Command2 'ping' @{} 15
   if (-not $r.ok) { throw $r.error }
@@ -104,8 +120,9 @@ Check "tabs.list" {
 }
 
 Check "eval 里 await 400ms（旧版 100ms 超时会挂在这）" {
+  if (-not $script:probeTab) { throw "没有验收标签页，跳过" }
   $expr = "(async () => { const t = Date.now(); await new Promise(r => setTimeout(r, 400)); return Date.now() - t; })()"
-  $r = Invoke-Command2 'eval' @{ expression = $expr } 30
+  $r = Invoke-Command2 'eval' @{ expression = $expr; tabId = $script:probeTab } 30
   if (-not $r.ok) { throw $r.error }
   $ms = [int]$r.result.value
   if ($ms -lt 350) { throw "只过了 ${ms}ms，计时器似乎没等满" }
@@ -113,15 +130,104 @@ Check "eval 里 await 400ms（旧版 100ms 超时会挂在这）" {
 }
 
 Check "content 读当前页" {
-  $r = Invoke-Command2 'content' @{ mode = 'text' } 30
+  if (-not $script:probeTab) { throw "没有验收标签页，跳过" }
+  $r = Invoke-Command2 'content' @{ mode = 'text'; tabId = $script:probeTab } 30
   if (-not $r.ok) { throw $r.error }
   $title = $r.result.title
   $len = "$($r.result.content)".Length
   "$title（$len 字符）url=$($r.result.url)"
 }
 
-# ── 3. 安装物检查 ──────────────────────────────────────────────────────────
-Write-Host "`n[3] 安装物" -ForegroundColor Cyan
+# ── 3. 接口分析 / JS 逆向能力（v1.0.9） ────────────────────────────────────
+if (-not $SkipAdvanced) {
+  Write-Host "`n[3] 逆向能力（v1.0.9 新增）" -ForegroundColor Cyan
+
+  Check "token 校验生效（不带 token 应被拒）" {
+    $body = @{ command = 'ping'; params = @{} } | ConvertTo-Json -Compress
+    $status = 0
+    try {
+      Invoke-RestMethod -Uri "$base/api/command" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 10 | Out-Null
+      $status = 200
+    } catch {
+      try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = -1 }
+    }
+    if ($status -eq 200) { throw "没有 token 也接受了请求 —— 插件侧还是旧代码，重启 DSH Desktop 让新版本生效" }
+    if ($status -ne 401) { throw "期望 401，实际 $status" }
+    "401 unauthorized（正确）"
+  }
+
+  Check "cdp 原始透传（DOM.getDocument）" {
+    $r = Invoke-Command2 'cdp' @{ method = 'DOM.getDocument'; params = @{ depth = 1 }; tabId = $script:probeTab } 30
+    if (-not $r.ok) { throw $r.error }
+    if (-not $r.result.result.root.nodeId) { throw "没拿到 root nodeId" }
+    "root nodeId=$($r.result.result.root.nodeId)"
+  }
+
+  Check "cookies.get 能读 HttpOnly" {
+    $r = Invoke-Command2 'cookies.get' @{ includeHttpOnly = $true; limit = 1000; tabId = $script:probeTab } 30
+    if (-not $r.ok) { throw $r.error }
+    "$($r.result.count) 个 cookie，其中 HttpOnly $($r.result.httpOnly) 个（来源 $($r.result.source)）"
+  }
+
+  Check "bodies.policy" {
+    $r = Invoke-Command2 'bodies.policy' @{} 15
+    if (-not $r.ok) { throw $r.error }
+    "policy=$($r.result.policy)"
+  }
+
+  Check "targets.list（可调试 target，含扩展 worker）" {
+    $r = Invoke-Command2 'targets.list' @{} 20
+    if (-not $r.ok) { throw $r.error }
+    $types = @($r.result.targets | ForEach-Object { $_.type } | Sort-Object -Unique) -join ','
+    "$($r.result.count) 个 target（类型：$types）"
+  }
+
+  Check "network.log 结构（含 extraInfo 头字段名）" {
+    $r = Invoke-Command2 'network.log' @{ limit = 5; tabId = $script:probeTab } 20
+    if (-not $r.ok) { throw $r.error }
+    "$($r.result.count)/$($r.result.total) 条"
+  }
+
+  Check "network.har 导出（不落盘）" {
+    $r = Invoke-Command2 'network.har' @{ includeStatic = $true; includeBodies = $false; tabId = $script:probeTab } 60
+    if (-not $r.ok) { throw $r.error }
+    if ($r.result.har.log.version -ne '1.2') { throw "HAR 版本异常：$($r.result.har.log.version)" }
+    "HAR 1.2，$($r.result.count) 条 entry"
+  }
+
+  Check "ws.log" {
+    $r = Invoke-Command2 'ws.log' @{ limit = 5; tabId = $script:probeTab } 20
+    if (-not $r.ok) { throw $r.error }
+    "$(@($r.result.sockets).Count) 个 socket / $($r.result.frameCount) 帧"
+  }
+
+  Check "scripts.list（Debugger.scriptParsed 全量脚本）" {
+    $r = Invoke-Command2 'scripts.list' @{ limit = 5; tabId = $script:probeTab } 40
+    if (-not $r.ok) { throw $r.error }
+    "注册脚本 $($r.result.total) 个（返回前 $($r.result.count)）"
+  }
+
+  Check "debugger.state" {
+    $r = Invoke-Command2 'debugger.state' @{ tabId = $script:probeTab } 20
+    if (-not $r.ok) { throw $r.error }
+    "enabled=$($r.result.enabled) paused=$($r.result.paused)"
+  }
+
+  Check "fetch.list" {
+    $r = Invoke-Command2 'fetch.list' @{ limit = 5; tabId = $script:probeTab } 20
+    if (-not $r.ok) { throw $r.error }
+    "enabled=$($r.result.enabled) parked=$($r.result.parked)"
+  }
+
+  Check "hook.log（页面级 fetch/XHR 记录器可读）" {
+    $r = Invoke-Command2 'hook.log' @{ limit = 1; tabId = $script:probeTab } 20
+    if (-not $r.ok) { throw $r.error }
+    "installed=$($r.result.installed)"
+  }
+}
+
+# ── 4. 安装物检查 ──────────────────────────────────────────────────────────
+Write-Host "`n[4] 安装物" -ForegroundColor Cyan
 
 Check "「浏览器操作」模式存在" {
   $dir = Join-Path $DshHome '.agent-presets\browser'

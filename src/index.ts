@@ -26,6 +26,7 @@ import type { SettingsScope } from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-invariants'
 import { BridgeServer, cleanupArtifacts } from './server.ts'
 import { BrowserLauncher, type ResolvedLaunchConfig } from './launch.ts'
+import { registerReverseTools } from './reverse.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'browser-bridge'
@@ -237,10 +238,16 @@ class BridgeController {
 	 * works while the bridge is stopped because it never touches the socket.
 	 * @returns counts and names of what was removed.
 	 */
-	async cleanup(): Promise<{ shotsRemoved: number; scratchRemoved: readonly string[] }> {
+	async cleanup(): Promise<{ shotsRemoved: number; scratchRemoved: readonly string[]; subdirsRemoved: readonly string[] }> {
 		const dir = this.shotsDir
 		if (dir === undefined) throw new Error('浏览器控制尚未加载配置，无法确定清理目录')
-		return cleanupArtifacts({ shotsDir: dir })
+		// The reverse-engineering tools write trees, not loose files: HAR
+		// exports, dumped script bundles and recovered sourcemap sources all
+		// live one level down and would otherwise survive every cleanup.
+		return cleanupArtifacts({
+			shotsDir: dir,
+			artifactSubdirs: ['har', 'scripts', 'sourcemaps'],
+		})
 	}
 
 	/** Stop the listener; safe to call repeatedly and during teardown. */
@@ -261,6 +268,25 @@ function clampText(value: string, maxChars: number): { content: string; truncate
 	return value.length <= maxChars
 		? { content: value, truncated: false }
 		: { content: value.slice(0, maxChars), truncated: true }
+}
+
+/**
+ * Model-facing text for a tool result.
+ *
+ * The `render` callback is the *only* channel the model receives: the canonical
+ * value is schema-validated but never delivered on its own. A summary-only
+ * render therefore hides exactly the data the tool exists to return (page text,
+ * element refs, request rows, script sources), so every data-bearing tool
+ * renders its payload here, capped so one call cannot swallow the context.
+ * @param value - the tool's canonical value.
+ * @param maxChars - character budget for the rendered text.
+ * @returns one text content block.
+ */
+function renderPayload(value: unknown, maxChars: number): Array<{ type: 'text'; text: string }> {
+	if (typeof value === 'string') return [{ type: 'text', text: value }]
+	const text = JSON.stringify(value, null, 1) ?? String(value)
+	if (text.length <= maxChars) return [{ type: 'text', text }]
+	return [{ type: 'text', text: `${text.slice(0, maxChars)}\n…(truncated — ${text.length - maxChars} more chars)` }]
 }
 
 /**
@@ -364,7 +390,14 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			+ 'and browser_click/browser_type accept the returned ref instead of guessing CSS selectors. '
 			+ 'browser_read extracts page text, browser_screenshot saves a PNG/JPEG and returns its file '
 			+ 'path (view it with an image tool). Calls fail with actionable copy while the bridge is '
-			+ 'disabled or no browser is connected.',
+			+ 'disabled or no browser is connected. '
+			+ 'For interface analysis and JS reverse engineering: browser_network_log (+ '
+			+ 'browser_network_body / browser_network_har / browser_websocket_log) shows traffic with the '
+			+ 'real wire headers, browser_cookies reads HttpOnly cookies, browser_scripts lists every '
+			+ 'parsed script and dumps sources or sourcemap-recovered trees, browser_debugger sets '
+			+ 'breakpoints and hooks functions to capture their arguments, browser_intercept rewrites '
+			+ 'live requests, browser_hook records what page JS passed to fetch/XHR, and browser_cdp '
+			+ 'reaches any Chrome DevTools Protocol method the wrappers do not cover.',
 	})
 
 	ctx.tools.register(defineTool({
@@ -420,7 +453,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			},
 			render: (_args, value) => [{
 				type: 'text',
-				text: `${value.title} (${value.url}) — ${value.content.length} chars${value.truncated ? ', truncated' : ''}`,
+				text: `${value.title} (${value.url})\n${value.content}${value.truncated ? '\n…(page text truncated)' : ''}`,
 			}],
 		},
 		presentCall: () => ({ card: 'generic', title: 'Read browser page', kind: 'other' as const }),
@@ -476,7 +509,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			},
 			render: (_args, value) => [{
 				type: 'text',
-				text: `${value.items.length} interactive elements on ${value.title}; click or fill them by ref.`,
+				text: `${value.items.length} interactive element(s) on ${value.title}\n${renderPayload(value.items, 8_000)[0]!.text}`,
 			}],
 		},
 		presentCall: () => ({ card: 'generic', title: 'Snapshot browser page', kind: 'other' as const }),
@@ -512,7 +545,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
-			render: (_args, value) => [{ type: 'text', text: JSON.stringify(value).slice(0, 300) }],
+			render: (_args, value) => renderPayload(value, 2_000),
 		},
 		presentCall: args => ({ card: 'generic', title: `Click ${args.ref ?? args.selector ?? ''}`, kind: 'other' as const }),
 		async execute(args, exec) {
@@ -535,7 +568,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
-			render: (_args, value) => [{ type: 'text', text: JSON.stringify(value).slice(0, 300) }],
+			render: (_args, value) => renderPayload(value, 2_000),
 		},
 		presentCall: args => ({ card: 'generic', title: `Type into ${args.ref ?? args.selector ?? 'element'}`, kind: 'other' as const }),
 		async execute(args, exec) {
@@ -558,7 +591,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
-			render: (_args, value) => [{ type: 'text', text: JSON.stringify(value).slice(0, 300) }],
+			render: (_args, value) => renderPayload(value, 2_000),
 		},
 		presentCall: args => ({ card: 'generic', title: `Press ${args.key}`, kind: 'other' as const }),
 		async execute(args, exec) {
@@ -578,7 +611,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
-			render: (_args, value) => [{ type: 'text', text: JSON.stringify(value).slice(0, 300) }],
+			render: (_args, value) => renderPayload(value, 2_000),
 		},
 		presentCall: () => ({ card: 'generic', title: 'Scroll browser page', kind: 'other' as const }),
 		async execute(args, exec) {
@@ -599,7 +632,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
-			render: (_args, value) => [{ type: 'text', text: JSON.stringify(value).slice(0, 400) }],
+			render: (_args, value) => renderPayload(value, 4_000),
 		},
 		presentCall: args => ({ card: 'generic', title: `Browser tabs: ${args.action}`, kind: 'other' as const }),
 		async execute(args, exec) {
@@ -638,7 +671,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 					json: { type: 'string', required: true },
 				},
 			},
-			render: (_args, value) => [{ type: 'text', text: value.json.slice(0, 300) }],
+			render: (_args, value) => [{ type: 'text', text: value.json.slice(0, 6_000) }],
 		},
 		presentCall: () => ({ card: 'generic', title: 'Evaluate in page', kind: 'other' as const }),
 		async execute(args, exec) {
@@ -692,7 +725,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 
 	ctx.tools.register(defineTool({
 		name: 'browser_cleanup',
-		description: 'Delete generated screenshots and agent scratch files (__-prefixed temp scripts/artifacts) from their top-level directories.',
+		description: 'Delete generated browser artifacts: screenshots and PDFs in the shots directory, the reverse-engineering trees under it (har/, scripts/, sourcemaps/), and __-prefixed agent scratch files.',
 		parameters: {},
 		output: {
 			schema: {
@@ -701,17 +734,22 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 				properties: {
 					shotsRemoved: { type: 'number', required: true },
 					scratchRemoved: { type: 'array', required: true, items: { type: 'string' } },
+					subdirsRemoved: { type: 'array', required: true, items: { type: 'string' } },
 				},
 			},
 			render: (_args, value) => [{
 				type: 'text',
-				text: `Cleaned ${value.shotsRemoved} screenshot(s) and ${value.scratchRemoved.length} scratch file(s)`,
+				text: `Cleaned ${value.shotsRemoved} screenshot(s), ${value.subdirsRemoved.length} artifact tree(s) and ${value.scratchRemoved.length} scratch file(s)`,
 			}],
 		},
 		presentCall: () => ({ card: 'generic', title: 'Clean up browser artifacts', kind: 'other' as const }),
 		async execute() {
 			const result = await controller.cleanup()
-			return { shotsRemoved: result.shotsRemoved, scratchRemoved: Array.from(result.scratchRemoved) }
+			return {
+				shotsRemoved: result.shotsRemoved,
+				scratchRemoved: Array.from(result.scratchRemoved),
+				subdirsRemoved: Array.from(result.subdirsRemoved),
+			}
 		},
 	}))
 
@@ -740,7 +778,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			},
 			render: (_args, value) => [{
 				type: 'text',
-				text: `Tab ${value.tabId}: ${value.count} of ${value.total} console entries`,
+				text: `Tab ${value.tabId}: ${value.count} of ${value.total} console entries\n${renderPayload(value.entries, 6_000)[0]!.text}`,
 			}],
 		},
 		presentCall: () => ({ card: 'generic', title: 'Read browser console', kind: 'other' as const }),
@@ -757,7 +795,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 
 	ctx.tools.register(defineTool({
 		name: 'browser_network_log',
-		description: 'Read captured HTTP request/response pairs for a tab. `includeStatic:true` adds images / fonts / stylesheets / scripts (filtered by default — they dominate the buffer). `methodPattern` / `urlPattern` / `status` filter server-side results; `clear:true` empties the buffer.',
+		description: 'Read captured HTTP request/response pairs for a tab. `includeStatic:true` adds images / fonts / stylesheets / scripts (filtered by default — they dominate the buffer). `methodPattern` / `urlPattern` / `status` filter server-side results; `clear:true` empties the buffer. `includeBodies:true` also fetches the response bodies that are still available (capped by `bodyLimit`).',
 		parameters: {
 			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
 			includeStatic: { type: 'boolean', description: 'Include images / fonts / stylesheets / scripts. Default false.' },
@@ -766,6 +804,8 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			status: { type: 'string', description: 'One of: 2xx, 3xx, 4xx, 5xx, failed, pending.' },
 			limit: { type: 'number', description: 'Maximum entries to return; default 200, capped at 1000.' },
 			clear: { type: 'boolean', description: 'Empty the buffer after reading.' },
+			includeBodies: { type: 'boolean', description: 'Also fetch response bodies that are still in memory (default false).' },
+			bodyLimit: { type: 'number', description: 'Maximum bodies to fetch when includeBodies is set (default 20, capped at 100).' },
 		},
 		output: {
 			schema: {
@@ -775,12 +815,22 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 					tabId: { type: 'number', required: true },
 					count: { type: 'number', required: true },
 					total: { type: 'number', required: true },
-					requests: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: {} } },
+					requests: { type: 'array', required: true, items: { type: 'object', additionalProperties: true } },
+					bodiesFetched: { type: 'number' },
 				},
 			},
 			render: (_args, value) => [{
 				type: 'text',
-				text: `Tab ${value.tabId}: ${value.count} of ${value.total} network requests`,
+				text: `Tab ${value.tabId}: ${value.count} of ${value.total} network requests${value.bodiesFetched ? ` (${value.bodiesFetched} bodies)` : ''}\n${renderPayload(value.requests.map((row: Record<string, JsonValue>) => ({
+					requestId: row.requestId,
+					method: row.method,
+					status: typeof row.status === 'number' ? row.status : row.failed === true ? 'failed' : undefined,
+					mimeType: row.mimeType,
+					resourceType: row.resourceType,
+					url: row.url,
+					bodyCached: row.bodyCached,
+					bodyError: row.bodyError,
+				})), 8_000)[0]!.text}`,
 			}],
 		},
 		presentCall: () => ({ card: 'generic', title: 'Read browser network log', kind: 'other' as const }),
@@ -793,7 +843,32 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			if (typeof args.status === 'string') params.status = args.status
 			if (typeof args.limit === 'number') params.limit = args.limit
 			if (args.clear === true) params.clear = true
-			return await controller.execute('network.log', params, exec.signal) as { tabId: number; count: number; total: number; requests: Array<Record<string, unknown>> }
+			const payload = await controller.execute('network.log', params, exec.signal) as {
+				tabId: number
+				count: number
+				total: number
+				requests: Array<Record<string, JsonValue>>
+			}
+			if (args.includeBodies !== true) return payload
+			const budget = Math.min(100, Math.max(1, args.bodyLimit ?? 20))
+			const wanted = payload.requests
+				.filter(entry => entry.failed !== true && typeof entry.requestId === 'string')
+				.slice(-budget)
+			let bodiesFetched = 0
+			for (const entry of wanted) {
+				try {
+					const body = await controller.execute('network.body', {
+						requestId: entry.requestId,
+						...(args.tabId === undefined ? {} : { tabId: args.tabId }),
+					}, exec.signal) as { body?: string; bytes?: number; base64Encoded?: boolean; error?: string }
+					if (typeof body.body === 'string') { entry.body = body.body; bodiesFetched += 1 }
+					else if (typeof body.error === 'string') entry.bodyError = body.error
+					if (typeof body.bytes === 'number') entry.bodyBytes = body.bytes
+				} catch (error) {
+					entry.bodyError = error instanceof Error ? error.message : String(error)
+				}
+			}
+			return { ...payload, bodiesFetched }
 		},
 	}))
 
@@ -915,6 +990,11 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			return await controller.execute('emulate', params, exec.signal) as { tabId: number; reset?: boolean; width?: number; height?: number; deviceScaleFactor?: number; isMobile?: boolean; hasTouch?: boolean; userAgent?: string }
 		},
 	}))
+
+	// Interface analysis + JS reverse engineering: raw CDP, cookies (HttpOnly
+	// included), response bodies, HAR export, WebSockets, script sources,
+	// sourcemaps, breakpoints/hooks, traffic rewriting, replay, page hooks.
+	registerReverseTools(ctx, controller)
 }
 
 /** Cordis plugin entry: wire the settings-driven lifecycle plus the model-facing tools. */

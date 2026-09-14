@@ -322,7 +322,45 @@ order: 10
 | `browser_network_clear` | Clear the captured request log (v1.0.7+) |
 | `browser_pdf` | Export the current page as PDF (v1.0.7+) |
 | `browser_emulate` | Switch to a device viewport (mobile / desktop / custom, v1.0.7+) |
-| `browser_cleanup` | Clean up temp files |
+| `browser_cleanup` | Delete generated artifacts: top-level screenshots / PDFs in shotsDir, the three reverse-engineering trees under it (`har/` / `scripts/` / `sourcemaps/`, removed whole) and `__`-prefixed scratch files (other top-level subdirectories are left alone) |
+
+### Interface analysis / JS reverse engineering (v1.0.9)
+
+A full toolkit (12 tools) for "how does this page call its APIs, and how are the parameters signed?". Everything rides the CDP attachment the extension already holds — no proxy, no certificates.
+
+| Tool | Purpose |
+|---|---|
+| `browser_cdp` | Raw CDP passthrough (`method` + `params`; optional `tabId`, or `targetId` for a worker / OOPIF / service worker). Network / Storage / Debugger / Fetch / Emulation / Runtime and every other domain at once — the fallback for whatever the wrappers do not cover |
+| `browser_cookies` | Cookie `get` / `set` / `delete` / `clear` through CDP, **HttpOnly included** |
+| `browser_body_policy` | Read or set the background response-body capture policy (`off` / `xhr` default / `all`); omit `policy` to just read it. This is what keeps a body available after the request is over |
+| `browser_targets` | List every debuggable target (pages / workers / other top-level targets), filterable by `type` / `tabId`; `autoAttach:true` turns Target auto-attach on for a tab — **a page's dedicated worker is only reported once you do** — and its `targetId` then drives `browser_cdp` to evaluate inside the worker, enable its Debugger domain or hot-patch it |
+| `browser_network_body` | One response body by `requestId`, or `kind:'request'` for a POST body |
+| `browser_network_har` | Export the whole session as HAR 1.2 (`Cookie` / `Set-Cookie` parsed), saved under `<shotsDir>/har/`, plus a request index; every entry carries `_requestId`, which feeds straight back into `browser_network_body` / `browser_network_replay` |
+| `browser_network_replay` | Replay a captured request from inside the page (page cookies, identical same-origin semantics), overriding `url` / `method` / `headers` / `body` |
+| `browser_websocket_log` | WebSocket handshake headers + frames (direction / opcode / payload) |
+| `browser_scripts` | `list` every parsed script / `source` one file / `dump` them all to disk (+ `manifest.json`) / `sourcemap` to restore the original sources tree from `sourcesContent` |
+| `browser_debugger` | `enable` / `break` / `unbreak` / `hook` (function-call breakpoint, captures real arguments) / `pause` / `resume` / `step` / `state` / `eval` (evaluate in a paused frame, can modify arguments) / `exceptions` |
+| `browser_intercept` | Fetch-domain rewriting: `enable` / `disable` / `list` / `continue` (new url / method / headers / body) / `fulfill` (fake the response) / `fail` / `body` / `auth` |
+| `browser_hook` | Page-level fetch/XHR recorder (`install`, optionally persistent across navigations / `log` / `restore`) — what the site's own JS passed in |
+
+A few supporting changes: `browser_network_log` rows now carry `requestId` and `bodyCached` (`bodyCached` only on those rows), and take `includeBodies` / `bodyLimit` to return the response bodies that are still available; HAR entries carry `_requestId`, matching the log rows one to one; setting the policy to `xhr` (default) or `all` with `browser_body_policy` makes bodies cache themselves as each request finishes (≤ 1 MB each). Capture also subscribes to the `*ExtraInfo` events now, so the real `Cookie` / `Authorization` / `Set-Cookie` headers are visible — `requestWillBeSent` deliberately omits them.
+
+**Signing logic hidden in a worker**: a page's dedicated workers (blob workers included) are **not** in the `chrome.debugger.getTargets()` list, and `browser_targets` cannot see them either — run `browser_targets {tabId, autoAttach: true}` first so Chrome reports each one with `source: "Target auto-attach"`, then hand its `targetId` to `browser_cdp`. On that path the `Browser.*` and `Target.getTargets` domains are closed to extension debugger clients (measured: `-32601 wasn't found` and `-32000 Not allowed` respectively), while `Target.setAutoAttach` is allowed and `Runtime.evaluate` / `Debugger.*` work normally against a worker target.
+
+**A typical reverse-engineering pass**
+
+1. **Capture** — open the target page and run `browser_network_log` (or go straight to `browser_network_har`) to list the endpoints; to save a step, set the policy to `xhr` or `all` with `browser_body_policy` so bodies are cached the moment each request finishes.
+2. **Read** — take a `requestId` from a row and pull the response (or POST) body with `browser_network_body`; export the session with `browser_network_har` and open it in DevTools / Charles / Fiddler (each entry's `_requestId` feeds straight back into `browser_network_body` / `browser_network_replay`). The real request headers (`Cookie`, `Authorization`, signature headers) live in `extraRequestHeaders`.
+3. **Find** — `browser_scripts` `list` to pick out the suspect bundle → `source` for the full text (or `dump` the lot) → `sourcemap` to restore the original sources tree and read `sign()` / `encrypt()` directly.
+4. **Break** — `browser_debugger` `hook` (e.g. `expression: "window.sign"`) pauses on every call of the signing function → `state` for the call stack → `eval` to read (or rewrite) its real arguments.
+5. **Verify** — `browser_intercept` `enable` to park a request → `continue` with edited parameters, or `fulfill` to fake the response; `browser_network_replay` re-issues it with the page's cookies so you can confirm how parameters relate to the signature.
+6. **Clean up** — `browser_intercept` `disable` (releases parked requests), `browser_debugger` `resume` / `unbreak`, `browser_hook` `restore`.
+
+Three things to know:
+
+- **A paused tab runs no page JS.** While the tab sits on a breakpoint, `browser_evaluate` / `browser_read` / `browser_click` / `browser_type` / `browser_press` / `browser_scroll` / `browser_snapshot` / `browser_navigate` / `browser_hook` **fail immediately** and tell you to `resume` first instead of burning the command timeout; `browser_debugger` `state` / `eval` / `step` / `resume` keep working.
+- **`browser_intercept` with `hold` really does hang the page.** Matched requests wait for `continue` / `fulfill` / `fail`, and the page looks frozen meanwhile; always `disable` when done (it releases everything parked).
+- **Artifacts all live under shotsDir** — the reverse-engineering output is the `har/`, `scripts/` and `sourcemaps/` subdirectories. `browser_cleanup` removes all three trees recursively, together with the top-level screenshots / PDFs and the `__`-prefixed scratch files (other top-level subdirectories are left alone).
 
 ## Architecture
 
@@ -353,6 +391,7 @@ Chrome browser
 | Auto-launch: no connection → plugin starts Chrome → extension handshake → original command runs | ✅ |
 | 1500 ms in-page evaluation (the case the old hidden 100 ms timeout always failed) | ✅ |
 | Six bundles fetched in-page (including a 148 KB JSVMP artifact) in 152 ms | ✅ |
+| Offline deep verification of the reverse tools via `node scripts/verify-reverse.mjs` (self-contained fixtures, input + output schemas validated) | ✅ |
 
 ## Changelog
 

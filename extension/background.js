@@ -53,8 +53,60 @@ const consoleLog = new Map();
 const tabBufferGenerations = new Map();
 /** Per-tab in-flight network entries keyed by `Network.requestId`; merged
  *  across `requestWillBeSent` / `responseReceived` / `loadingFinished` /
- *  `loadingFailed`. Map<tabId, Map<requestId, entry>>. */
+ *  `loadingFailed` (plus the `*ExtraInfo` events, which is where the real
+ *  `Cookie` / `Set-Cookie` / `Authorization` headers live).
+ *  Map<tabId, Map<requestId, entry>>. */
 const networkLog = new Map();
+/** Per-tab response bodies fetched through `Network.getResponseBody`, keyed by
+ *  requestId. Chrome keeps a body available only until the renderer evicts it,
+ *  so entries carry either the bytes or the reason they are gone.
+ *  Map<tabId, Map<requestId, {body, base64Encoded, bytes, truncated, error}>>. */
+const bodyCache = new Map();
+/** Per-tab `Debugger` domain state (enabled, paused, call frames, hits).
+ *  Map<tabId, object>. */
+const debuggerState = new Map();
+/** Per-tab `Debugger.scriptParsed` registry — every script the tab ever parsed,
+ *  including inline/eval/webpack chunks that never appear as a DOM `<script src>`.
+ *  Map<tabId, Map<scriptId, entry>>. */
+const scriptRegistry = new Map();
+/** Per-tab ring of past `Debugger.paused` events (last 20) so a pause that was
+ *  already resumed stays auditable. Map<tabId, Array<entry>>. */
+const pauseLog = new Map();
+/** Per-tab WebSocket sockets + captured frames. Map<tabId, {sockets, frames}>. */
+const wsLog = new Map();
+/** Per-tab `Fetch` interception state: enabled flag, patterns, paused requests
+ *  and the pause log the model reads. Map<tabId, {enabled, patterns, stage,
+ *  paused, log}>. */
+const fetchState = new Map();
+/** Per-tab targets discovered through `Target.attachedToTarget` /
+ *  `Target.targetCreated` events (workers, OOPIFs). `chrome.debugger.getTargets()`
+ *  does not enumerate a page's dedicated workers, so auto-attach is the only way
+ *  to learn their ids and drive them with `cdp {targetId}`.
+ *  Map<tabId, Map<targetId, entry>>. */
+const targetRegistry = new Map();
+/** Scripts registered per tab are capped so a long-lived page cannot grow the
+ *  registry without bound. */
+const SCRIPT_REGISTRY_MAX = 5_000;
+/** WebSocket frames kept per tab (ring). */
+const WS_FRAME_MAX = 2_000;
+/** Intercepted-request log kept per tab (ring). */
+const FETCH_LOG_MAX = 500;
+/** Bodies larger than this are reported as metadata only, not transferred. */
+const BODY_MAX_BYTES = 8 * 1024 * 1024;
+/** Auto-capture ceiling for a single response body (small ones are cheap). */
+const BODY_AUTO_MAX_BYTES = 1 * 1024 * 1024;
+/**
+ * Response-body auto-capture policy:
+ *   'off' — never fetch bodies in the background (on-demand only)
+ *   'xhr' — auto-capture XHR/Fetch responses (default: the API traffic)
+ *   'all' — every document/script/font/… response too
+ * Set with the `bodies.policy` command. Background capture is best-effort:
+ * `Network.getResponseBody` fails once the renderer drops the body.
+ */
+let bodyAutoCapture = 'xhr';
+/** Set by `bodies.policy` to also keep request post bodies beyond the 64KB
+ *  inline cap (fetched on demand through `Network.getRequestPostData`). */
+const bodiesAutoPolicyValues = new Set(['off', 'xhr', 'all']);
 
 /**
  * Native dialog (alert/confirm/prompt) auto-answer policy. 'accept' answers
@@ -387,6 +439,9 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 		if (!entry) return;
 		entry.encodedDataLength = params.encodedDataLength;
 		entry.finished = true;
+		// Best-effort background body capture: the renderer drops the body once
+		// it is done with it, so this has to happen now if it happens at all.
+		if (shouldAutoCaptureBody(entry)) void captureResponseBody(tabId, params.requestId);
 		return;
 	}
 	if (method === 'Network.loadingFailed') {
@@ -399,7 +454,322 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 		entry.canceled = params.canceled;
 		return;
 	}
+	if (method === 'Network.requestWillBeSentExtraInfo') {
+		// The headers Chrome actually put on the wire. This is the only place
+		// `Cookie` / `Authorization` are visible: the plain
+		// `Network.requestWillBeSent` payload deliberately omits them.
+		const tabMap = networkLog.get(tabId);
+		const entry = tabMap && tabMap.get(params.requestId);
+		if (entry) entry.extraRequestHeaders = params.headers;
+		return;
+	}
+	if (method === 'Network.responseReceivedExtraInfo') {
+		// Where `Set-Cookie` lives (and the real status code on redirect chains).
+		const tabMap = networkLog.get(tabId);
+		const entry = tabMap && tabMap.get(params.requestId);
+		if (entry) {
+			entry.extraResponseHeaders = params.headers;
+			if (params.statusCode !== undefined) entry.rawStatusCode = params.statusCode;
+		}
+		return;
+	}
+	if (method === 'Network.webSocketCreated') {
+		const st = ensureWsState(tabId);
+		st.sockets.set(params.requestId, {
+			requestId: params.requestId,
+			url: params.url,
+			initiator: params.initiator && params.initiator.url,
+			created: Date.now(),
+			framesSent: 0,
+			framesReceived: 0,
+			closed: false,
+		});
+		return;
+	}
+	if (method === 'Network.webSocketWillSendHandshakeRequest') {
+		const st = ensureWsState(tabId);
+		const sock = st.sockets.get(params.requestId);
+		if (sock) sock.requestHeaders = params.request && params.request.headers;
+		return;
+	}
+	if (method === 'Network.webSocketHandshakeResponseReceived') {
+		const st = ensureWsState(tabId);
+		const sock = st.sockets.get(params.requestId);
+		if (sock && params.response) {
+			sock.status = params.response.status;
+			sock.statusText = params.response.statusText;
+			sock.responseHeaders = params.response.headers;
+		}
+		return;
+	}
+	if (method === 'Network.webSocketFrameSent' || method === 'Network.webSocketFrameReceived') {
+		const st = ensureWsState(tabId);
+		const dir = method.endsWith('Sent') ? 'sent' : 'received';
+		const sock = st.sockets.get(params.requestId);
+		if (sock) {
+			if (dir === 'sent') sock.framesSent += 1; else sock.framesReceived += 1;
+		}
+		const p = params.response || {};
+		const raw = typeof p.payloadData === 'string' ? p.payloadData : '';
+		st.frames.push({
+			requestId: params.requestId,
+			dir,
+			opcode: p.opcode,
+			bytes: raw.length,
+			payload: raw.length > 200_000 ? raw.slice(0, 200_000) + '…(truncated)' : raw,
+			t: Date.now(),
+		});
+		if (st.frames.length > WS_FRAME_MAX) st.frames.shift();
+		return;
+	}
+	if (method === 'Network.webSocketClosed') {
+		const st = ensureWsState(tabId);
+		const sock = st.sockets.get(params.requestId);
+		if (sock) { sock.closed = true; sock.closedAt = Date.now(); }
+		return;
+	}
+	if (method === 'Network.webSocketFrameError') {
+		const st = ensureWsState(tabId);
+		const sock = st.sockets.get(params.requestId);
+		if (sock) sock.error = params.errorMessage;
+		return;
+	}
+	if (method === 'Debugger.scriptParsed') {
+		let reg = scriptRegistry.get(tabId);
+		if (!reg) { reg = new Map(); scriptRegistry.set(tabId, reg); }
+		reg.set(params.scriptId, {
+			scriptId: params.scriptId,
+			url: params.url,
+			sourceMapURL: params.sourceMapURL || '',
+			length: params.length,
+			startLine: params.startLine, startColumn: params.startColumn,
+			endLine: params.endLine, endColumn: params.endColumn,
+			executionContextId: params.executionContextId,
+			hash: params.hash,
+			isModule: params.isModule,
+			hasSourceURL: params.hasSourceURL,
+			embedderName: params.embedderName,
+			t: Date.now(),
+		});
+		if (reg.size > SCRIPT_REGISTRY_MAX) reg.delete(reg.keys().next().value);
+		return;
+	}
+	if (method === 'Debugger.paused') {
+		const state = ensureDebuggerState(tabId);
+		state.paused = true;
+		state.reason = params.reason;
+		state.hitBreakpoints = params.hitBreakpoints || [];
+		state.callFrames = params.callFrames || [];
+		state.data = params.data ?? null;
+		state.pausedAt = Date.now();
+		state.pauseCount = (state.pauseCount || 0) + 1;
+		const log = pauseLog.get(tabId) || [];
+		log.push({
+			t: state.pausedAt,
+			reason: params.reason,
+			hitBreakpoints: params.hitBreakpoints || [],
+			top: summarizeFrame((params.callFrames || [])[0]),
+		});
+		if (log.length > 20) log.shift();
+		pauseLog.set(tabId, log);
+		return;
+	}
+	if (method === 'Debugger.resumed') {
+		const state = ensureDebuggerState(tabId);
+		state.paused = false;
+		state.callFrames = [];
+		state.hitBreakpoints = [];
+		state.reason = null;
+		return;
+	}
+	if (method === 'Fetch.requestPaused') {
+		const st = ensureFetchState(tabId);
+		const entry = {
+			requestId: params.requestId,
+			url: params.request && params.request.url,
+			method: params.request && params.request.method,
+			headers: params.request && params.request.headers,
+			postData: params.request && params.request.postData,
+			resourceType: params.resourceType,
+			responseStatusCode: params.responseStatusCode,
+			responseHeaders: params.responseHeaders,
+			responseErrorReason: params.responseErrorReason,
+			networkId: params.networkId,
+			stage: params.responseStatusCode !== undefined ? 'response' : 'request',
+			t: Date.now(),
+		};
+		st.paused.set(params.requestId, entry);
+		st.log.push(entry);
+		if (st.log.length > FETCH_LOG_MAX) st.log.shift();
+		// Record-only mode (`hold: false`) must forward the request itself —
+		// merely recording it would park the page forever, which is exactly what
+		// the "safe, just watch" mode promises not to do.
+		if (st.hold === false) {
+			const responseStage = params.responseStatusCode !== undefined;
+			const continueOnce = (cdpMethod) => new Promise((resolve) => {
+				chrome.debugger.sendCommand({ tabId }, cdpMethod, { requestId: params.requestId }, () => {
+					const failed = Boolean(chrome.runtime.lastError);
+					void chrome.runtime.lastError;
+					resolve(!failed);
+				});
+			});
+			void (async () => {
+				const done = responseStage
+					? (await continueOnce('Fetch.continueResponse')) || (await continueOnce('Fetch.continueRequest'))
+					: await continueOnce('Fetch.continueRequest');
+				if (done) st.paused.delete(params.requestId);
+			})();
+		}
+		return;
+	}
+	if (method === 'Fetch.authRequired') {
+		// Only fires when Fetch was enabled with handleAuthRequests. Recorded,
+		// never auto-answered in hold mode: the request stays parked until the
+		// caller sends `fetch.auth` (or the interception is disabled). In
+		// record-only mode it must be answered, or the page hangs on a prompt
+		// nobody is looking at.
+		const st = ensureFetchState(tabId);
+		st.auth = st.auth || [];
+		st.auth.push({ requestId: params.requestId, authChallenge: params.authChallenge, t: Date.now() });
+		if (st.auth.length > 50) st.auth.shift();
+		if (st.hold === false) {
+			chrome.debugger.sendCommand(
+				{ tabId },
+				'Fetch.continueWithAuth',
+				{ requestId: params.requestId, authChallengeResponse: { response: 'Default' } },
+				() => void chrome.runtime.lastError,
+			);
+		}
+		return;
+	}
+	if (method === 'Target.attachedToTarget' || method === 'Target.targetCreated' || method === 'Target.targetInfoChanged') {
+		const info = params.targetInfo || {};
+		const targetId = info.targetId || params.targetId;
+		if (!targetId) return;
+		let reg = targetRegistry.get(tabId);
+		if (!reg) { reg = new Map(); targetRegistry.set(tabId, reg); }
+		const previous = reg.get(targetId) || {};
+		reg.set(targetId, {
+			...previous,
+			targetId,
+			type: info.type || previous.type || 'unknown',
+			url: info.url !== undefined ? info.url : previous.url,
+			title: info.title !== undefined ? info.title : previous.title,
+			attached: info.attached !== undefined ? info.attached : previous.attached,
+			sessionId: params.sessionId || previous.sessionId,
+			via: method,
+			t: Date.now(),
+		});
+		if (reg.size > 200) reg.delete(reg.keys().next().value);
+		return;
+	}
+	if (method === 'Target.detachedFromTarget') {
+		const reg = targetRegistry.get(tabId);
+		if (reg && params.targetId) reg.delete(params.targetId);
+		return;
+	}
 });
+
+/* ------------------------------------------- capture-state helpers (Phase 1/2) */
+
+function ensureWsState(tabId) {
+	let st = wsLog.get(tabId);
+	if (!st) { st = { sockets: new Map(), frames: [] }; wsLog.set(tabId, st); }
+	return st;
+}
+
+function ensureFetchState(tabId) {
+	let st = fetchState.get(tabId);
+	if (!st) {
+		st = { enabled: false, patterns: null, stage: 'Request', hold: true, paused: new Map(), log: [], auth: [] };
+		fetchState.set(tabId, st);
+	}
+	return st;
+}
+
+function ensureDebuggerState(tabId) {
+	let st = debuggerState.get(tabId);
+	if (!st) {
+		st = {
+			enabled: false, paused: false, reason: null, hitBreakpoints: [],
+			callFrames: [], data: null, pauseCount: 0, breakpoints: new Map(),
+		};
+		debuggerState.set(tabId, st);
+	}
+	return st;
+}
+
+/** One-line view of a call frame, safe to log without the whole scope chain. */
+function summarizeFrame(frame) {
+	if (!frame) return null;
+	return {
+		callFrameId: frame.callFrameId,
+		functionName: frame.functionName,
+		url: frame.url,
+		location: frame.location,
+		scopeCount: (frame.scopeChain || []).length,
+	};
+}
+
+/** `Network.getResponseBody` result shape, normalized and size-capped. */
+function normalizeBody(res, requestId) {
+	const raw = res && typeof res.body === 'string' ? res.body : '';
+	const base64Encoded = Boolean(res && res.base64Encoded);
+	const bytes = base64Encoded ? Math.floor(raw.length * 0.75) : raw.length;
+	if (bytes > BODY_MAX_BYTES) {
+		return { requestId, body: null, base64Encoded, bytes, truncated: true, error: `body exceeds ${BODY_MAX_BYTES} bytes` };
+	}
+	return { requestId, body: raw, base64Encoded, bytes, truncated: false };
+}
+
+/** Fetch one response body and memoize it. Never throws — failures are data. */
+async function captureResponseBody(tabId, requestId) {
+	const tabMap = bodyCache.get(tabId);
+	if (tabMap && tabMap.has(requestId)) return tabMap.get(requestId);
+	let out;
+	try {
+		// withCDP, not dbgSend: an on-demand `network.body` can be the very first
+		// CDP call on a tab (background capture only ever runs on an attached
+		// tab), and it must attach — and retry once after a dropped attachment —
+		// instead of failing with "Debugger is not attached to the tab".
+		const res = await withCDP(tabId, (send) => send('Network.getResponseBody', { requestId }));
+		out = normalizeBody(res, requestId);
+	} catch (err) {
+		out = { requestId, body: null, error: String((err && err.message) || err), unavailable: true };
+	}
+	let map = bodyCache.get(tabId);
+	if (!map) { map = new Map(); bodyCache.set(tabId, map); }
+	map.set(requestId, out);
+	if (map.size > 500) map.delete(map.keys().next().value);
+	return out;
+}
+
+/** Whether the loadingFinished hook should grab this body unprompted. */
+function shouldAutoCaptureBody(entry) {
+	if (bodyAutoCapture === 'off') return false;
+	if (entry.failed) return false;
+	if (bodyAutoCapture === 'xhr') {
+		const type = entry.resourceType;
+		if (type !== 'XHR' && type !== 'Fetch') return false;
+	}
+	if (entry.encodedDataLength !== undefined && entry.encodedDataLength > BODY_AUTO_MAX_BYTES) return false;
+	return true;
+}
+
+/**
+ * Refuse to run DOM/JS work on a tab that is parked at a debugger breakpoint:
+ * `Runtime.evaluate` against a paused renderer never returns, so the caller
+ * would ride the whole command timeout instead of learning why.
+ */
+function assertNotPaused(tabId) {
+	const st = debuggerState.get(tabId);
+	if (!st || !st.paused) return;
+	const top = summarizeFrame((st.callFrames || [])[0]);
+	const where = top && top.url ? `${top.url}:${(top.location || {}).lineNumber}` : 'unknown location';
+	const err = new Error(`tab ${tabId} is paused at a breakpoint (${st.reason || 'other'}) at ${where} — resume it first (debugger.resume) or the page's JS cannot run`);
+	err.code = 'tab_paused';
+	throw err;
+}
 
 /** Cap a per-tab request map at 500 entries (LRU-by-insertion-order). */
 function trimNetworkMap(tabMap) {
@@ -413,6 +783,12 @@ function detachTab(tabId) {
 	attachedTabs.delete(tabId);
 	consoleLog.delete(tabId);
 	networkLog.delete(tabId);
+	bodyCache.delete(tabId);
+	wsLog.delete(tabId);
+	scriptRegistry.delete(tabId);
+	debuggerState.delete(tabId);
+	pauseLog.delete(tabId);
+	fetchState.delete(tabId);
 	tabBufferGenerations.delete(tabId);
 	chrome.debugger.detach({ tabId }, () => void chrome.runtime.lastError);
 }
@@ -426,6 +802,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 	if (attachedTabs.has(tabId)) attachedTabs.delete(tabId);
 	consoleLog.delete(tabId);
 	networkLog.delete(tabId);
+	bodyCache.delete(tabId);
+	wsLog.delete(tabId);
+	scriptRegistry.delete(tabId);
+	debuggerState.delete(tabId);
+	pauseLog.delete(tabId);
+	fetchState.delete(tabId);
 	tabBufferGenerations.delete(tabId);
 });
 
@@ -539,9 +921,13 @@ async function cmdNetworkLog(params) {
 	});
 	filtered.sort((a, b) => (a.wallTime || 0) - (b.wallTime || 0));
 	const limit = Math.min(1000, Math.max(1, Number(params.limit) || 200));
+	const cache = bodyCache.get(tab.id);
 	const out = filtered.slice(-limit).map((e) => {
-		const { requestId: _id, tabId: _t, ...rest } = e;
-		return rest;
+		const { tabId: _t, ...rest } = e;
+		// `requestId` stays in the row: it is the handle every follow-up needs
+		// (network.body, network.replay, per-request correlation). `bodyCached`
+		// tells the caller a body is already available without a second round trip.
+		return { ...rest, bodyCached: cache ? cache.has(e.requestId) : false };
 	});
 	if (params.clear === true) networkLog.set(tab.id, new Map());
 	return { tabId: tab.id, count: out.length, total: filtered.length, requests: out };
@@ -644,10 +1030,15 @@ async function cmdTabsList() {
 
 async function cmdTabsOpen(params) {
 	if (!params.url) throw new Error('params.url is required');
-	const created = await chrome.tabs.create({
-		url: params.url,
-		active: params.active !== undefined ? Boolean(params.active) : true,
-	});
+	const active = params.active !== undefined ? Boolean(params.active) : true;
+	// Open on about:blank, attach, *then* navigate. Creating the tab straight at
+	// the target URL would put the document request (and everything racing it)
+	// outside the capture window, because Network.* events only flow while a
+	// debugger is attached. A failed attach (DevTools holding the tab) must not
+	// block the navigation.
+	const created = await chrome.tabs.create({ url: 'about:blank', active });
+	await ensureAttached(created.id).catch(() => {});
+	await chrome.tabs.update(created.id, { url: params.url }).catch(() => {});
 	if (params.wait !== false) await waitTabComplete(created.id, Number(params.timeoutMs) || 15_000);
 	const fresh = await chrome.tabs.get(created.id).catch(() => null);
 	return { tabId: created.id, url: fresh?.url, title: fresh?.title };
@@ -668,6 +1059,13 @@ async function cmdTabsActivate(params) {
 async function cmdNav(params) {
 	if (!params.url) throw new Error('params.url is required');
 	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
+	// Attach before navigating so the whole load — the document request
+	// included — lands in the network buffer. Network.* events only flow while
+	// a debugger is attached, so attaching afterwards would silently miss it.
+	// A failed attach (DevTools holding the tab, or a chrome:// target) must
+	// not block the navigation itself.
+	await ensureAttached(tab.id).catch(() => {});
 	await chrome.tabs.update(tab.id, { url: params.url });
 	if (params.wait !== false) await waitTabComplete(tab.id, Number(params.timeoutMs) || 15_000);
 	const fresh = await chrome.tabs.get(tab.id).catch(() => null);
@@ -709,6 +1107,7 @@ async function cmdEval(params) {
 		throw new Error('params.expression is required');
 	}
 	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
 	// Frame targeting: params.frameSelector (CSS selector of an <iframe>) runs
 	// the expression inside that frame via contentDocument (same-origin).
 	// Cross-origin frames need a separate debugger target — reported clearly.
@@ -800,9 +1199,29 @@ async function cmdEval(params) {
 			throw err;
 		});
 	});
-	const value = evalTimeoutMs
-		? await Promise.race([evaluate, raceTimeout(evalTimeoutMs)])
-		: await evaluate;
+	// An eval that trips a breakpoint parks the renderer, so `Runtime.evaluate`
+	// cannot finish until someone resumes: without this watcher the caller just
+	// rides the whole command timeout with no idea why.
+	let pauseWatcher = null;
+	const pauseRace = new Promise((_, reject) => {
+		pauseWatcher = setInterval(() => {
+			const st = debuggerState.get(tab.id);
+			if (!st || !st.paused) return;
+			clearInterval(pauseWatcher);
+			pauseWatcher = null;
+			const top = summarizeFrame((st.callFrames || [])[0]);
+			const where = top && top.url ? `${top.url}:${(top.location || {}).lineNumber}` : 'an unknown location';
+			const err = new Error(`eval paused at a breakpoint (${st.reason || 'other'}) at ${where} — the renderer is frozen until debugger.resume; inspect the frames with debugger.state / debugger.eval first`);
+			err.code = 'tab_paused';
+			reject(err);
+		}, 100);
+	});
+	const clearWatcher = () => { if (pauseWatcher !== null) { clearInterval(pauseWatcher); pauseWatcher = null; } };
+	const value = await Promise.race([
+		evaluate.then((result) => { clearWatcher(); return result; }, (error) => { clearWatcher(); throw error; }),
+		pauseRace,
+		...(evalTimeoutMs ? [raceTimeout(evalTimeoutMs)] : []),
+	]).finally(clearWatcher);
 	// Serialize what we honestly got. `value` here is a RemoteObject; a
 	// missing `.value` on a non-primitive means transfer was impossible.
 	let out;
@@ -821,6 +1240,7 @@ async function cmdEval(params) {
 async function cmdContent(params) {
 	const mode = params.mode === 'html' ? 'html' : 'text';
 	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
 	const inner = mode === 'html'
 		? 'document.documentElement.outerHTML'
 		: '(document.body && (document.body.innerText || document.body.textContent)) || ""';
@@ -839,6 +1259,7 @@ async function cmdFind(params) {
 	if (!params.selector) throw new Error('params.selector is required');
 	const limit = Math.max(1, Math.min(50, Number(params.limit) || 10));
 	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
 	const payload = await withCDP(tab.id, (send) => send('Runtime.evaluate', {
 		expression: `(() => {
 			const els = [...document.querySelectorAll(${JSON.stringify(String(params.selector))})];
@@ -864,6 +1285,7 @@ async function cmdFind(params) {
 async function cmdClick(params) {
 	if (!params.selector) throw new Error('params.selector is required');
 	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
 	// Mouse events land on whatever is under the viewport coordinates of the
 	// focused tab; ensure our tab is frontmost so coordinates are meaningful.
 	await activateTabWindow(tab.id);
@@ -906,6 +1328,7 @@ async function cmdInput(params) {
 	if (!params.selector) throw new Error('params.selector is required');
 	if (params.value === undefined) throw new Error('params.value is required');
 	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
 	// 'type' mode drives the real keyboard pipeline (Input.insertText per
 	// keystroke) so stateful components (React-controlled, search bars with
 	// internal suggestion state) observe every character. 'fill' (default)
@@ -1030,6 +1453,7 @@ async function cmdPress(params) {
 	const key = String(params.key ?? '');
 	if (key.length === 0) throw new Error('params.key is required');
 	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
 	// Key events need OS focus; a background tab swallows them silently.
 	await activateTabWindow(tab.id);
 	let keyCode, code;
@@ -1109,6 +1533,7 @@ async function cmdScreenshot(params) {
 
 async function cmdScroll(params) {
 	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
 	const dx = Number.isFinite(Number(params.x)) ? Number(params.x) : 0;
 	const dy = Number.isFinite(Number(params.y)) ? Number(params.y) : 0;
 	return withCDP(tab.id, (send) => send('Runtime.evaluate', {
@@ -1129,6 +1554,7 @@ const SNAPSHOT_SELECTOR = 'a[href], button, input, select, textarea, [role="butt
 
 async function cmdSnapshot(params) {
 	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
 	const limit = Math.min(200, Math.max(1, Number(params.limit) || 120));
 	return withCDP(tab.id, async (send) => {
 		await send('Runtime.enable').catch(() => {});
@@ -1169,6 +1595,1006 @@ async function cmdSnapshot(params) {
 	});
 }
 
+/* ================= Phase 1/2: interface analysis + JS reverse engineering ==== */
+
+/**
+ * Every debuggable target Chrome knows about: tabs, OOPIFs, dedicated/shared
+ * workers, service workers. This is the only way to *discover* a target id —
+ * the CDP `Target` domain answers "Not allowed" for chrome.debugger clients —
+ * and a target id is what `cdp` needs to drive a worker directly, which is
+ * where a lot of real signing logic lives.
+ */
+async function cmdTargetsList(params) {
+	const targets = await chrome.debugger.getTargets();
+	const typeFilter = typeof params.type === 'string' && params.type.length > 0 ? params.type : null;
+	const tabFilter = params.tabId === undefined ? null : Number(params.tabId);
+	const rows = targets
+		.filter((t) => (typeFilter === null ? true : t.type === typeFilter))
+		.filter((t) => (tabFilter === null ? true : t.tabId === tabFilter))
+		.map((t) => ({
+			targetId: t.id,
+			type: t.type,
+			title: t.title,
+			url: t.url,
+			tabId: t.tabId,
+			attached: t.attached,
+			source: 'chrome.debugger.getTargets',
+		}));
+	// Merge in whatever Target auto-attach reported: this is the only place a
+	// page's dedicated workers show up at all.
+	const seen = new Set(rows.map((r) => r.targetId));
+	const scopedTabs = tabFilter === null ? [...targetRegistry.keys()] : [tabFilter];
+	for (const tabId of scopedTabs) {
+		const reg = targetRegistry.get(tabId);
+		if (!reg) continue;
+		for (const entry of reg.values()) {
+			if (seen.has(entry.targetId)) {
+				const existing = rows.find((r) => r.targetId === entry.targetId);
+				if (existing) existing.attached = existing.attached || entry.attached === true;
+				continue;
+			}
+			if (typeFilter !== null && entry.type !== typeFilter) continue;
+			seen.add(entry.targetId);
+			rows.push({
+				targetId: entry.targetId,
+				type: entry.type,
+				title: entry.title,
+				url: entry.url,
+				tabId,
+				attached: entry.attached === true,
+				sessionId: entry.sessionId,
+				source: 'Target auto-attach',
+			});
+		}
+	}
+	return { count: rows.length, targets: rows, autoAttachTabs: [...targetRegistry.keys()] };
+}
+
+/**
+ * Turn Target auto-attach on/off for a tab. With it on, Chrome reports the
+ * page's children (dedicated workers, OOPIFs) as `Target.attachedToTarget`, and
+ * their ids become drivable through `cdp {targetId}` — the CDP `Target` domain
+ * refuses `getTargets` for extension clients, but accepts `setAutoAttach`.
+ */
+async function cmdTargetsAutoAttach(params) {
+	const tab = await resolveTab(params.tabId);
+	const enable = params.enable !== false;
+	const wait = params.waitForDebuggerOnStart === true;
+	await withCDP(tab.id, (send) => send('Target.setAutoAttach', {
+		autoAttach: enable,
+		waitForDebuggerOnStart: wait,
+		flatten: true,
+	}));
+	if (!enable) {
+		targetRegistry.delete(tab.id);
+		return { tabId: tab.id, autoAttach: false, targets: [] };
+	}
+	// Children already alive are reported as events; give them a moment to land.
+	await new Promise((resolve) => setTimeout(resolve, 400));
+	const reg = targetRegistry.get(tab.id);
+	const targets = reg ? [...reg.values()] : [];
+	return { tabId: tab.id, autoAttach: true, count: targets.length, targets };
+}
+
+/** Headers arrive as a plain object; HAR wants an array. Later sources win. */
+function headersToHar(...sources) {
+	const merged = {};
+	for (const src of sources) {
+		if (!src || typeof src !== 'object') continue;
+		for (const [name, value] of Object.entries(src)) {
+			if (value === undefined || value === null) continue;
+			merged[name] = Array.isArray(value) ? value.join(', ') : String(value);
+		}
+	}
+	return Object.entries(merged).map(([name, value]) => ({ name, value }));
+}
+
+function parseCookieHeader(value) {
+	if (typeof value !== 'string' || value.length === 0) return [];
+	return value.split(';').map((part) => part.trim()).filter(Boolean).map((pair) => {
+		const eq = pair.indexOf('=');
+		return eq < 0
+			? { name: pair, value: '' }
+			: { name: pair.slice(0, eq).trim(), value: pair.slice(eq + 1).trim() };
+	});
+}
+
+function parseSetCookie(value) {
+	if (typeof value !== 'string' || value.length === 0) return null;
+	const parts = value.split(';').map((p) => p.trim());
+	const eq = parts[0].indexOf('=');
+	const cookie = {
+		name: eq < 0 ? parts[0] : parts[0].slice(0, eq).trim(),
+		value: eq < 0 ? '' : parts[0].slice(eq + 1).trim(),
+	};
+	for (const attr of parts.slice(1)) {
+		const [rawKey, ...rest] = attr.split('=');
+		const key = rawKey.trim().toLowerCase();
+		const val = rest.join('=').trim();
+		if (key === 'domain') cookie.domain = val;
+		else if (key === 'path') cookie.path = val;
+		else if (key === 'expires') cookie.expires = val;
+		else if (key === 'httponly') cookie.httpOnly = true;
+		else if (key === 'secure') cookie.secure = true;
+		else if (key === 'samesite') cookie.sameSite = val;
+	}
+	return cookie;
+}
+
+/** One captured network entry → a HAR 1.2 entry. */
+function toHarEntry(entry, body) {
+	const requestHeaders = headersToHar(entry.headers, entry.extraRequestHeaders);
+	const responseHeaders = headersToHar(entry.responseHeaders, entry.extraResponseHeaders);
+	const cookieHeader = (requestHeaders.find((h) => h.name.toLowerCase() === 'cookie') || {}).value;
+	const setCookies = responseHeaders.filter((h) => h.name.toLowerCase() === 'set-cookie');
+	const started = entry.wallTime ? new Date(entry.wallTime * 1000).toISOString() : new Date(entry.t || Date.now()).toISOString();
+	let queryString = [];
+	try {
+		queryString = [...new URL(entry.url).searchParams.entries()].map(([name, value]) => ({ name, value }));
+	} catch { /* data:/blob: URLs have no query */ }
+	const content = body && body.body !== null && body.body !== undefined
+		? {
+			size: body.bytes,
+			mimeType: entry.mimeType || '',
+			text: body.base64Encoded ? undefined : body.body,
+			encoding: body.base64Encoded ? 'base64' : undefined,
+		}
+		: { size: entry.encodedDataLength || 0, mimeType: entry.mimeType || '' };
+	if (body && body.error) content._unavailable = body.error;
+	return {
+		startedDateTime: started,
+		time: 0,
+		request: {
+			method: entry.method || 'GET',
+			url: entry.url,
+			httpVersion: 'HTTP/1.1',
+			cookies: parseCookieHeader(cookieHeader),
+			headers: requestHeaders,
+			queryString,
+			headersSize: -1,
+			bodySize: entry.postData ? entry.postData.length : 0,
+			...(entry.postData ? { postData: { mimeType: (requestHeaders.find((h) => h.name.toLowerCase() === 'content-type') || {}).value || '', text: entry.postData } } : {}),
+		},
+		response: {
+			status: entry.status || 0,
+			statusText: entry.statusText || '',
+			httpVersion: 'HTTP/1.1',
+			cookies: setCookies.map((h) => parseSetCookie(h.value)).filter(Boolean),
+			headers: responseHeaders,
+			content,
+			redirectURL: (responseHeaders.find((h) => h.name.toLowerCase() === 'location') || {}).value || '',
+			headersSize: -1,
+			bodySize: entry.encodedDataLength || -1,
+		},
+		cache: {},
+		timings: { send: 0, wait: 0, receive: 0 },
+		...(entry.failed ? { _error: entry.errorText || 'failed' } : {}),
+		...(entry.extraRequestHeaders ? { _requestHeadersSource: 'extraInfo (wire headers)' } : {}),
+		// Custom HAR fields are underscore-prefixed by convention; this one lets a
+		// HAR row be fed straight back into network.body / network.replay.
+		_requestId: entry.requestId,
+		_serverIPAddress: undefined,
+	};
+}
+
+/** Raw CDP passthrough: every DevTools capability the extension did not wrap. */
+async function cmdCdp(params) {
+	const method = typeof params.method === 'string' ? params.method.trim() : '';
+	if (!method) throw new Error('params.method is required (e.g. "Network.getAllCookies")');
+	const targetId = typeof params.targetId === 'string' && params.targetId ? params.targetId : null;
+	if (targetId) {
+		// Non-tab target (worker / OOPIF / service worker). Attach to the target
+		// itself; commands addressed to a target we never attached to fail.
+		await new Promise((resolve, reject) => {
+			chrome.debugger.attach({ targetId }, '1.3', () => {
+				const err = chrome.runtime.lastError;
+				if (err && !/already attached/i.test(err.message)) reject(new Error(`debugger attach failed: ${err.message}`));
+				else resolve();
+			});
+		});
+		const result = await new Promise((resolve, reject) => {
+			chrome.debugger.sendCommand({ targetId }, method, params.params ?? {}, (res) => {
+				const err = chrome.runtime.lastError;
+				if (err) reject(new Error(`${method} failed: ${err.message}`));
+				else resolve(res);
+			});
+		});
+		return { targetId, method, result };
+	}
+	const tab = await resolveTab(params.tabId);
+	const result = await withCDP(tab.id, (send) => send(method, params.params ?? {}));
+	return { tabId: tab.id, method, result };
+}
+
+/** Read/set the background response-body capture policy. */
+async function cmdBodiesPolicy(params) {
+	if (params && params.policy !== undefined) {
+		const policy = String(params.policy);
+		if (!bodiesAutoPolicyValues.has(policy)) throw new Error(`invalid policy: ${policy} (use off|xhr|all)`);
+		bodyAutoCapture = policy;
+	}
+	return { policy: bodyAutoCapture, maxBytes: BODY_MAX_BYTES, autoMaxBytes: BODY_AUTO_MAX_BYTES };
+}
+
+/** One response body (or request post body) on demand. */
+async function cmdNetworkBody(params) {
+	const tab = await resolveTab(params.tabId);
+	const requestId = typeof params.requestId === 'string' ? params.requestId : '';
+	if (!requestId) throw new Error('params.requestId is required (take it from network.log)');
+	if (params.kind === 'request') {
+		const res = await withCDP(tab.id, (send) => send('Network.getRequestPostData', { requestId }));
+		const postData = (res && res.postData) || '';
+		return { tabId: tab.id, requestId, kind: 'request', postData, bytes: postData.length };
+	}
+	const body = await captureResponseBody(tab.id, requestId);
+	return { tabId: tab.id, kind: 'response', ...body };
+}
+
+/** Whole captured conversation as a HAR 1.2 document. */
+async function cmdNetworkHar(params) {
+	const tab = await resolveTab(params.tabId);
+	const tabMap = networkLog.get(tab.id);
+	const all = tabMap ? [...tabMap.values()] : [];
+	const includeStatic = params.includeStatic === true;
+	const staticTypes = new Set(['Image', 'Font', 'Stylesheet', 'Script', 'Favicon', 'Manifest']);
+	const filtered = all
+		.filter((e) => includeStatic || !staticTypes.has(e.resourceType))
+		.sort((a, b) => (a.wallTime || 0) - (b.wallTime || 0));
+	const includeBodies = params.includeBodies !== false;
+	const entries = [];
+	for (const entry of filtered) {
+		let body = null;
+		if (includeBodies && !entry.failed) body = await captureResponseBody(tab.id, entry.requestId).catch(() => null);
+		entries.push(toHarEntry(entry, body));
+	}
+	if (params.clear === true) networkLog.set(tab.id, new Map());
+	return {
+		tabId: tab.id,
+		url: (await chrome.tabs.get(tab.id).catch(() => ({}))).url,
+		count: entries.length,
+		har: {
+			log: {
+				version: '1.2',
+				creator: { name: 'DSH Browser Control', version: EXT_VERSION },
+				pages: [],
+				entries,
+			},
+		},
+	};
+}
+
+/* --------------------------------------------------------------- cookies */
+
+/**
+ * Read cookies. With `url` this asks Chrome which cookies that URL would send
+ * (the accurate per-request view); otherwise it returns the whole profile jar.
+ * HttpOnly cookies are included — that is the point of going through CDP.
+ */
+async function cmdCookiesGet(params) {
+	const tab = await resolveTab(params.tabId);
+	const url = typeof params.url === 'string' && params.url ? params.url : null;
+	const res = url
+		? await withCDP(tab.id, (send) => send('Network.getCookies', { urls: [url] }))
+		: await withCDP(tab.id, (send) => send('Network.getAllCookies', {}));
+	let cookies = (res && res.cookies) || [];
+	const nameFilter = typeof params.name === 'string' && params.name ? new RegExp(params.name) : null;
+	const domainFilter = typeof params.domain === 'string' && params.domain ? new RegExp(params.domain, 'i') : null;
+	if (nameFilter) cookies = cookies.filter((c) => nameFilter.test(c.name));
+	if (domainFilter) cookies = cookies.filter((c) => domainFilter.test(c.domain || ''));
+	if (params.includeHttpOnly === false) cookies = cookies.filter((c) => !c.httpOnly);
+	if (params.value === false) cookies = cookies.map((c) => ({ ...c, value: undefined, valueLength: (c.value || '').length }));
+	const limit = Math.min(5_000, Math.max(1, Number(params.limit) || 1_000));
+	return {
+		tabId: tab.id,
+		source: url ? 'Network.getCookies' : 'Network.getAllCookies',
+		scope: url || 'whole profile',
+		count: cookies.length,
+		httpOnly: cookies.filter((c) => c.httpOnly).length,
+		cookies: cookies.slice(0, limit),
+	};
+}
+
+async function cmdCookiesSet(params) {
+	const tab = await resolveTab(params.tabId);
+	if (typeof params.name !== 'string' || !params.name) throw new Error('params.name is required');
+	if (typeof params.value !== 'string') throw new Error('params.value is required');
+	const cdpParams = { name: params.name, value: params.value };
+	if (params.url) cdpParams.url = String(params.url);
+	else if (params.domain) {
+		cdpParams.domain = String(params.domain);
+		cdpParams.path = params.path ? String(params.path) : '/';
+	} else throw new Error('provide params.url, or params.domain (+ optional path)');
+	for (const key of ['path', 'secure', 'httpOnly', 'sameSite', 'expires', 'priority']) {
+		if (params[key] !== undefined) cdpParams[key] = params[key];
+	}
+	const res = await withCDP(tab.id, (send) => send('Network.setCookie', cdpParams));
+	return { tabId: tab.id, success: res && res.success !== false, cookie: { ...cdpParams, value: undefined, valueLength: String(params.value).length } };
+}
+
+async function cmdCookiesDelete(params) {
+	const tab = await resolveTab(params.tabId);
+	if (typeof params.name !== 'string' || !params.name) throw new Error('params.name is required');
+	const cdpParams = { name: params.name };
+	if (params.url) cdpParams.url = String(params.url);
+	if (params.domain) cdpParams.domain = String(params.domain);
+	if (params.path) cdpParams.path = String(params.path);
+	if (!params.url && !params.domain) throw new Error('provide params.url or params.domain so Chrome knows which cookie jar to edit');
+	await withCDP(tab.id, (send) => send('Network.deleteCookies', cdpParams));
+	return { tabId: tab.id, deleted: true, name: params.name, url: params.url, domain: params.domain, path: params.path };
+}
+
+async function cmdCookiesClear(params) {
+	const tab = await resolveTab(params.tabId);
+	await withCDP(tab.id, (send) => send('Network.clearBrowserCookies', {}));
+	return { tabId: tab.id, cleared: true };
+}
+
+/* ------------------------------------------------------------ websockets */
+
+async function cmdWsLog(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = wsLog.get(tab.id) || { sockets: new Map(), frames: [] };
+	const limit = Math.min(2_000, Math.max(1, Number(params.limit) || 200));
+	const pattern = typeof params.urlPattern === 'string' && params.urlPattern ? new RegExp(params.urlPattern, 'i') : null;
+	const sockets = [...st.sockets.values()].filter((s) => !pattern || pattern.test(s.url || ''));
+	const ids = new Set(sockets.map((s) => s.requestId));
+	let frames = st.frames.filter((f) => ids.has(f.requestId));
+	if (params.direction === 'sent' || params.direction === 'received') frames = frames.filter((f) => f.dir === params.direction);
+	if (params.payloadPattern) {
+		const re = new RegExp(params.payloadPattern, 'i');
+		frames = frames.filter((f) => re.test(f.payload || ''));
+	}
+	const tail = frames.slice(-limit);
+	if (params.clear === true) { st.frames = []; wsLog.set(tab.id, st); }
+	return { tabId: tab.id, sockets, frameCount: frames.length, frames: tail };
+}
+
+/* --------------------------------------------------------- JS: scripts */
+
+/** Turn the Debugger domain on (idempotent) and let scriptParsed land. */
+async function ensureDebuggerReady(tabId, waitMs = 250) {
+	const st = ensureDebuggerState(tabId);
+	if (!st.enabled) {
+		await withCDP(tabId, (send) => send('Debugger.enable', {}));
+		st.enabled = true;
+		await dbgSend(tabId, 'Debugger.setAsyncCallStackDepth', { maxDepth: 32 }).catch(() => {});
+		await dbgSend(tabId, 'Runtime.setAsyncCallStackDepth', { maxDepth: 32 }).catch(() => {});
+	}
+	if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+	return st;
+}
+
+async function cmdScriptsList(params) {
+	const tab = await resolveTab(params.tabId);
+	await ensureDebuggerReady(tab.id);
+	const reg = scriptRegistry.get(tab.id);
+	let scripts = reg ? [...reg.values()] : [];
+	const urlPattern = typeof params.urlPattern === 'string' && params.urlPattern ? new RegExp(params.urlPattern, 'i') : null;
+	if (urlPattern) scripts = scripts.filter((s) => urlPattern.test(s.url || ''));
+	if (params.withSourceMap === true) scripts = scripts.filter((s) => Boolean(s.sourceMapURL));
+	if (params.minLength !== undefined) scripts = scripts.filter((s) => (s.length || 0) >= Number(params.minLength));
+	if (params.inlineOnly === true) scripts = scripts.filter((s) => !s.url || s.url.startsWith('webpack://'));
+	scripts.sort((a, b) => (b.length || 0) - (a.length || 0));
+	const limit = Math.min(2_000, Math.max(1, Number(params.limit) || 200));
+	return {
+		tabId: tab.id,
+		total: (reg ? reg.size : 0),
+		count: scripts.length,
+		scripts: scripts.slice(0, limit).map((s) => ({
+			...s,
+			inline: !s.url,
+			hasSourceMap: Boolean(s.sourceMapURL),
+		})),
+	};
+}
+
+async function cmdScriptsSource(params) {
+	const tab = await resolveTab(params.tabId);
+	await ensureDebuggerReady(tab.id);
+	const reg = scriptRegistry.get(tab.id);
+	if (!reg || reg.size === 0) throw new Error('no scripts registered for this tab yet — call scripts.list first, then reload the page if it is still empty');
+	let target = null;
+	if (params.scriptId) target = reg.get(String(params.scriptId)) || null;
+	if (!target && params.url) target = [...reg.values()].filter((s) => s.url === params.url)[0] || null;
+	if (!target && params.urlPattern) {
+		const re = new RegExp(String(params.urlPattern), 'i');
+		const matches = [...reg.values()].filter((s) => re.test(s.url || ''));
+		const index = Math.max(0, Number(params.index) || 0);
+		target = matches[index] || null;
+		if (matches.length > 1 && params.index === undefined) {
+			return {
+				tabId: tab.id,
+				ambiguous: true,
+				matches: matches.slice(0, 25).map((s) => ({ scriptId: s.scriptId, url: s.url, length: s.length })),
+				hint: 'several scripts match — pass params.index or params.scriptId',
+			};
+		}
+	}
+	if (!target) throw new Error('script not found: pass scriptId, an exact url, or urlPattern (+ index)');
+	const res = await withCDP(tab.id, (send) => send('Debugger.getScriptSource', { scriptId: target.scriptId }));
+	const source = (res && res.scriptSource) || '';
+	const maxBytes = Math.min(64 * 1024 * 1024, Math.max(1_000, Number(params.maxBytes) || 16 * 1024 * 1024));
+	const truncated = source.length > maxBytes;
+	return {
+		tabId: tab.id,
+		scriptId: target.scriptId,
+		url: target.url,
+		sourceMapURL: target.sourceMapURL || '',
+		bytes: source.length,
+		truncated,
+		source: truncated ? source.slice(0, maxBytes) : source,
+	};
+}
+
+/* --------------------------------------------------- JS: debugger control */
+
+/** Poll until a *new* pause lands (step/pause commands do not pause inline). */
+async function waitForPause(tabId, previousCount, timeoutMs) {
+	const st = ensureDebuggerState(tabId);
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		if (st.paused && (st.pauseCount || 0) > previousCount) return st;
+		if (Date.now() >= deadline) {
+			const err = new Error(`no pause within ${timeoutMs}ms (the breakpoint may not have been hit)`);
+			err.code = 'pause_timeout';
+			throw err;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+}
+
+function debuggerSnapshot(tabId, full) {
+	const st = ensureDebuggerState(tabId);
+	const frames = st.callFrames || [];
+	return {
+		tabId,
+		enabled: st.enabled,
+		paused: st.paused,
+		reason: st.reason,
+		hitBreakpoints: st.hitBreakpoints || [],
+		pauseCount: st.pauseCount || 0,
+		breakpoints: [...st.breakpoints.values()],
+		pauseHistory: pauseLog.get(tabId) || [],
+		callFrames: full
+			? frames
+			: frames.map((f) => ({
+				callFrameId: f.callFrameId,
+				functionName: f.functionName,
+				url: f.url,
+				location: f.location,
+				scopes: (f.scopeChain || []).map((s) => s.type),
+			})),
+	};
+}
+
+async function cmdDebuggerEnable(params) {
+	const tab = await resolveTab(params.tabId);
+	ensureDebuggerState(tab.id).enabled = false; // force a fresh enable so
+	// scriptParsed for everything already loaded is replayed to us.
+	await ensureDebuggerReady(tab.id);
+	const reg = scriptRegistry.get(tab.id);
+	return { tabId: tab.id, scripts: reg ? reg.size : 0 };
+}
+
+async function cmdDebuggerBreak(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = await ensureDebuggerReady(tab.id);
+	if (params.scriptId) {
+		if (params.lineNumber === undefined) throw new Error('params.lineNumber is required with params.scriptId');
+		const res = await withCDP(tab.id, (send) => send('Debugger.setBreakpoint', {
+			location: {
+				scriptId: String(params.scriptId),
+				lineNumber: Number(params.lineNumber),
+				...(params.columnNumber !== undefined ? { columnNumber: Number(params.columnNumber) } : {}),
+			},
+			...(params.condition ? { condition: String(params.condition) } : {}),
+		}));
+		const record = { breakpointId: res.breakpointId, kind: 'location', scriptId: String(params.scriptId), lineNumber: Number(params.lineNumber), condition: params.condition || null, actualLocation: res.actualLocation };
+		st.breakpoints.set(res.breakpointId, record);
+		return { tabId: tab.id, ...record };
+	}
+	if (params.lineNumber === undefined) throw new Error('params.lineNumber is required (0-based)');
+	if (!params.url && !params.urlRegex) throw new Error('provide params.url (exact) or params.urlRegex');
+	const res = await withCDP(tab.id, (send) => send('Debugger.setBreakpointByUrl', {
+		lineNumber: Number(params.lineNumber),
+		...(params.columnNumber !== undefined ? { columnNumber: Number(params.columnNumber) } : {}),
+		...(params.url ? { url: String(params.url) } : { urlRegex: String(params.urlRegex) }),
+		...(params.condition ? { condition: String(params.condition) } : {}),
+	}));
+	const record = {
+		breakpointId: res.breakpointId,
+		kind: params.url ? 'url' : 'urlRegex',
+		url: params.url || null,
+		urlRegex: params.urlRegex || null,
+		lineNumber: Number(params.lineNumber),
+		condition: params.condition || null,
+		locations: res.locations,
+	};
+	st.breakpoints.set(res.breakpointId, record);
+	return { tabId: tab.id, ...record, resolvedNow: (res.locations || []).length };
+}
+
+async function cmdDebuggerUnbreak(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = ensureDebuggerState(tab.id);
+	const breakpointId = typeof params.breakpointId === 'string' ? params.breakpointId : '';
+	if (!breakpointId) {
+		if (params.all === true) {
+			const ids = [...st.breakpoints.keys()];
+			for (const id of ids) await dbgSend(tab.id, 'Debugger.removeBreakpoint', { breakpointId: id }).catch(() => {});
+			st.breakpoints.clear();
+			return { tabId: tab.id, removed: ids.length, remaining: 0 };
+		}
+		throw new Error('params.breakpointId is required (or pass all:true)');
+	}
+	await withCDP(tab.id, (send) => send('Debugger.removeBreakpoint', { breakpointId }));
+	st.breakpoints.delete(breakpointId);
+	return { tabId: tab.id, removed: 1, remaining: st.breakpoints.size };
+}
+
+/**
+ * Hook a function by reference: evaluate an expression that yields the current
+ * function object, then break whenever it is called. This is the "watch the
+ * sign()/encrypt() call with its real arguments" move without hunting for the
+ * line number in a minified bundle.
+ */
+async function cmdDebuggerHook(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = await ensureDebuggerReady(tab.id);
+	const expression = typeof params.expression === 'string' && params.expression ? params.expression : '';
+	if (!expression) throw new Error('params.expression is required (must evaluate to a function object, e.g. "window.encrypt" or "JSON.parse")');
+	const evaluated = await withCDP(tab.id, (send) => send('Runtime.evaluate', {
+		expression, returnByValue: false, awaitPromise: true, userGesture: true,
+	}));
+	if (evaluated.exceptionDetails) {
+		throw new Error(`expression threw: ${evaluated.exceptionDetails.exception?.description || evaluated.exceptionDetails.text}`);
+	}
+	const objectId = evaluated.result && evaluated.result.objectId;
+	if (!objectId) throw new Error(`expression did not yield an object (got ${evaluated.result && evaluated.result.type}) — a function reference is required`);
+	const res = await withCDP(tab.id, (send) => send('Debugger.setBreakpointOnFunctionCall', {
+		objectId,
+		...(params.condition ? { condition: String(params.condition) } : {}),
+	}));
+	const record = { breakpointId: res.breakpointId, kind: 'functionCall', expression, condition: params.condition || null, description: evaluated.result.description };
+	st.breakpoints.set(res.breakpointId, record);
+	return { tabId: tab.id, ...record };
+}
+
+async function cmdDebuggerPause(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = await ensureDebuggerReady(tab.id);
+	const before = st.pauseCount || 0;
+	await withCDP(tab.id, (send) => send('Debugger.pause', {}));
+	const timeoutMs = Math.min(30_000, Math.max(500, Number(params.timeoutMs) || 5_000));
+	const paused = await waitForPause(tab.id, before, timeoutMs);
+	return { tabId: tab.id, ...debuggerSnapshot(tab.id, params.full === true), reason: paused.reason };
+}
+
+async function cmdDebuggerResume(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = ensureDebuggerState(tab.id);
+	if (!st.paused && params.force !== true) return { tabId: tab.id, resumed: false, note: 'tab was not paused' };
+	await withCDP(tab.id, (send) => send('Debugger.resume', { terminateOnResume: false }));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	return { tabId: tab.id, resumed: true, paused: ensureDebuggerState(tab.id).paused };
+}
+
+async function cmdDebuggerStep(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = await ensureDebuggerReady(tab.id);
+	const action = String(params.action || 'over');
+	const method = action === 'into' ? 'Debugger.stepInto' : action === 'out' ? 'Debugger.stepOut' : 'Debugger.stepOver';
+	const before = st.pauseCount || 0;
+	await withCDP(tab.id, (send) => send(method, {}));
+	const timeoutMs = Math.min(30_000, Math.max(500, Number(params.timeoutMs) || 5_000));
+	try {
+		const paused = await waitForPause(tab.id, before, timeoutMs);
+		return { tabId: tab.id, stepped: action, ...debuggerSnapshot(tab.id, params.full === true), reason: paused.reason };
+	} catch (err) {
+		// A step that runs off the end of the program resumes the page instead.
+		return { tabId: tab.id, stepped: action, ...debuggerSnapshot(tab.id, params.full === true), note: String(err.message || err) };
+	}
+}
+
+async function cmdDebuggerState(params) {
+	const tab = await resolveTab(params.tabId);
+	return { ...debuggerSnapshot(tab.id, params.full === true) };
+}
+
+async function cmdDebuggerEval(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = ensureDebuggerState(tab.id);
+	if (!st.paused) throw new Error('the tab is not paused — nothing to evaluate on; set a breakpoint and wait for a pause first');
+	if (!params.callFrameId) throw new Error('params.callFrameId is required (from debugger.state callFrames)');
+	if (typeof params.expression !== 'string' || !params.expression) throw new Error('params.expression is required');
+	const res = await withCDP(tab.id, (send) => send('Debugger.evaluateOnCallFrame', {
+		callFrameId: String(params.callFrameId),
+		expression: String(params.expression),
+		returnByValue: params.returnByValue !== false,
+		awaitPromise: true,
+		userGesture: true,
+	}));
+	if (res.exceptionDetails) throw new Error(`frame exception: ${res.exceptionDetails.exception?.description || res.exceptionDetails.text}`);
+	const result = res.result || {};
+	return {
+		tabId: tab.id,
+		type: result.type,
+		value: result.value !== undefined ? result.value : (result.description || `[${result.type}: wrap in JSON.stringify()]`),
+		objectId: result.objectId,
+	};
+}
+
+async function cmdDebuggerExceptions(params) {
+	const tab = await resolveTab(params.tabId);
+	await ensureDebuggerReady(tab.id);
+	const state = ['none', 'uncaught', 'all'].includes(String(params.state)) ? String(params.state) : 'none';
+	await withCDP(tab.id, (send) => send('Debugger.setPauseOnExceptions', { state }));
+	const st = ensureDebuggerState(tab.id);
+	// Turning the policy off is the "I am done with exceptions" gesture, so a
+	// page left parked by one is released instead of staying frozen until the
+	// caller remembers to resume it separately.
+	let resumed = false;
+	if (state === 'none' && st.paused && st.reason === 'exception') {
+		await withCDP(tab.id, (send) => send('Debugger.resume', { terminateOnResume: false })).catch(() => {});
+		resumed = true;
+	}
+	return { tabId: tab.id, pauseOnExceptions: state, resumed };
+}
+
+/* --------------------------------------------------- Fetch: intercept/rewrite */
+
+async function cmdFetchEnable(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = ensureFetchState(tab.id);
+	const hold = params.hold !== false;
+	st.hold = hold;
+	const patterns = Array.isArray(params.patterns) && params.patterns.length > 0
+		? params.patterns.map((p) => ({
+			urlPattern: p.urlPattern ? String(p.urlPattern) : '*',
+			...(p.resourceType ? { resourceType: String(p.resourceType) } : {}),
+			...(p.requestStage ? { requestStage: String(p.requestStage) } : {}),
+		}))
+		: [{ urlPattern: String(params.urlPattern || '*'), requestStage: params.stage === 'response' ? 'Response' : 'Request' }];
+	st.patterns = patterns;
+	st.stage = params.stage === 'response' ? 'Response' : 'Request';
+	await withCDP(tab.id, (send) => send('Fetch.enable', {
+		patterns,
+		handleAuthRequests: params.handleAuthRequests === true,
+	}));
+	st.enabled = true;
+	return {
+		tabId: tab.id,
+		enabled: true,
+		patterns,
+		hold,
+		note: hold
+			? 'matching requests now park until fetch.continue / fetch.fulfill / fetch.fail is sent — the page will look frozen meanwhile'
+			: 'matching requests are recorded and continued automatically',
+	};
+}
+
+async function cmdFetchDisable(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = ensureFetchState(tab.id);
+	await withCDP(tab.id, (send) => send('Fetch.disable', {})).catch(() => {});
+	st.enabled = false;
+	const released = st.paused.size;
+	st.paused.clear();
+	return { tabId: tab.id, enabled: false, released };
+}
+
+async function cmdFetchList(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = ensureFetchState(tab.id);
+	const limit = Math.min(FETCH_LOG_MAX, Math.max(1, Number(params.limit) || 50));
+	const pattern = typeof params.urlPattern === 'string' && params.urlPattern ? new RegExp(params.urlPattern, 'i') : null;
+	const rows = (params.parked === true ? [...st.paused.values()] : st.log).filter((e) => !pattern || pattern.test(e.url || ''));
+	const tail = rows.slice(-limit);
+	if (params.clear === true) st.log = [];
+	return {
+		tabId: tab.id,
+		enabled: st.enabled,
+		hold: st.hold !== false,
+		patterns: st.patterns,
+		parked: st.paused.size,
+		parkedIds: [...st.paused.keys()],
+		count: tail.length,
+		requests: tail,
+		pendingAuth: st.auth || [],
+	};
+}
+
+function takePaused(tabId, requestId) {
+	const st = ensureFetchState(tabId);
+	if (!requestId) throw new Error('params.requestId is required (from fetch.list)');
+	if (!st.paused.has(requestId)) {
+		throw new Error(`request ${requestId} is not parked (fetch.list shows the ids currently held; Fetch.disable releases everything)`);
+	}
+	return st;
+}
+
+async function cmdFetchContinue(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = takePaused(tab.id, params.requestId);
+	const entry = st.paused.get(params.requestId);
+	const cdpParams = { requestId: String(params.requestId) };
+	if (params.url) cdpParams.url = String(params.url);
+	if (params.method) cdpParams.method = String(params.method).toUpperCase();
+	if (params.postData !== undefined) cdpParams.postData = params.postData === null ? undefined : String(params.postData);
+	if (params.headers) {
+		const merged = { ...(entry.headers || {}), ...params.headers };
+		cdpParams.headers = Object.entries(merged).map(([name, value]) => ({ name, value: String(value) }));
+	}
+	if (params.interceptResponse === true) cdpParams.interceptResponse = true;
+	const stage = entry.stage === 'response' && params.interceptResponse !== true;
+	const method = stage ? 'Fetch.continueResponse' : 'Fetch.continueRequest';
+	try {
+		await withCDP(tab.id, (send) => send(method, cdpParams));
+	} catch (err) {
+		if (stage && /wasn't found|not found|Invalid parameters/i.test(String(err.message))) {
+			await withCDP(tab.id, (send) => send('Fetch.continueRequest', cdpParams));
+		} else throw err;
+	}
+	st.paused.delete(String(params.requestId));
+	return { tabId: tab.id, continued: true, requestId: params.requestId, viaMethod: method, modified: Boolean(params.url || params.method || params.headers || params.postData !== undefined) };
+}
+
+async function cmdFetchFulfill(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = takePaused(tab.id, params.requestId);
+	const responseCode = Number(params.responseCode) || 200;
+	// Byte length of the body being sent: a base64 payload's decoded length is
+	// its binary-string length, while a text payload must be measured in UTF-8
+	// code units, never in JS characters.
+	let body;
+	let bodyBytes = 0;
+	if (params.bodyBase64 !== undefined) {
+		body = String(params.bodyBase64);
+		bodyBytes = atob(body).length;
+	} else if (params.body !== undefined) {
+		const text = typeof params.body === 'string' ? params.body : JSON.stringify(params.body);
+		body = base64EncodeUtf8(text);
+		bodyBytes = utf8ByteLength(text);
+	}
+	const cdpParams = { requestId: String(params.requestId), responseCode };
+	if (params.responsePhrase) cdpParams.responsePhrase = String(params.responsePhrase);
+	const headers = { ...(params.responseHeaders || {}) };
+	if (body !== undefined && !Object.keys(headers).some((h) => h.toLowerCase() === 'content-type')) headers['Content-Type'] = 'application/json; charset=utf-8';
+	if (body !== undefined) headers['Content-Length'] = String(bodyBytes);
+	if (Object.keys(headers).length > 0) cdpParams.responseHeaders = Object.entries(headers).map(([name, value]) => ({ name, value: String(value) }));
+	if (body !== undefined) cdpParams.body = body;
+	await withCDP(tab.id, (send) => send('Fetch.fulfillRequest', cdpParams));
+	st.paused.delete(String(params.requestId));
+	return { tabId: tab.id, fulfilled: true, requestId: params.requestId, responseCode, bodyBytes };
+}
+
+async function cmdFetchFail(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = takePaused(tab.id, params.requestId);
+	const errorReason = String(params.errorReason || 'Failed');
+	await withCDP(tab.id, (send) => send('Fetch.failRequest', { requestId: String(params.requestId), errorReason }));
+	st.paused.delete(String(params.requestId));
+	return { tabId: tab.id, failed: true, requestId: params.requestId, errorReason };
+}
+
+async function cmdFetchBody(params) {
+	const tab = await resolveTab(params.tabId);
+	if (!params.requestId) throw new Error('params.requestId is required');
+	const res = await withCDP(tab.id, (send) => send('Fetch.getResponseBody', { requestId: String(params.requestId) }));
+	const raw = (res && res.body) || '';
+	const base64Encoded = Boolean(res && res.base64Encoded);
+	return { tabId: tab.id, requestId: params.requestId, base64Encoded, bytes: base64Encoded ? Math.floor(raw.length * 0.75) : raw.length, body: raw };
+}
+
+async function cmdFetchAuth(params) {
+	const tab = await resolveTab(params.tabId);
+	const st = ensureFetchState(tab.id);
+	if (!params.requestId) throw new Error('params.requestId is required (from fetch.list pendingAuth)');
+	const response = ['Default', 'CancelAuth', 'ProvideCredentials'].includes(String(params.response)) ? String(params.response) : 'Default';
+	const cdpParams = { requestId: String(params.requestId), authChallengeResponse: { response } };
+	if (response === 'ProvideCredentials') {
+		if (!params.username) throw new Error('params.username is required with ProvideCredentials');
+		cdpParams.authChallengeResponse.username = String(params.username);
+		cdpParams.authChallengeResponse.password = String(params.password || '');
+	}
+	await withCDP(tab.id, (send) => send('Fetch.continueWithAuth', cdpParams));
+	st.auth = (st.auth || []).filter((a) => a.requestId !== params.requestId);
+	return { tabId: tab.id, requestId: params.requestId, answered: response };
+}
+
+/* -------------------------------------------------- replay + page-level hooks */
+
+/** UTF-8 safe base64 for CDP bodies (btoa alone chokes on non-Latin1). */
+function base64EncodeUtf8(text) {
+	const bytes = new TextEncoder().encode(text);
+	let binary = '';
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	return btoa(binary);
+}
+
+function utf8ByteLength(text) {
+	try { return new TextEncoder().encode(text).length; } catch { return String(text).length; }
+}
+
+const REPLAY_MAX_BYTES = 512 * 1024;
+
+/**
+ * Re-issue a captured request from inside the page. Running in the page keeps
+ * cookies, origin and CORS semantics identical to the original call — a
+ * same-origin XHR replays perfectly; a cross-origin one replays only where the
+ * site itself was allowed to call it.
+ */
+async function cmdNetworkReplay(params) {
+	const tab = await resolveTab(params.tabId);
+	if (!attachedTabs.has(tab.id)) await ensureAttached(tab.id);
+	assertNotPaused(tab.id);
+	let base = null;
+	if (params.requestId) {
+		const tabMap = networkLog.get(tab.id);
+		base = tabMap && tabMap.get(String(params.requestId));
+		if (!base) throw new Error(`unknown requestId ${params.requestId} (the buffer keeps the last 500 requests of this tab)`);
+	}
+	const url = params.url || (base && base.url);
+	if (!url) throw new Error('provide params.url, or a params.requestId still in the buffer');
+	const method = String(params.method || (base && base.method) || 'GET').toUpperCase();
+	const headers = {
+		...(base ? headersToHar(base.headers, base.extraRequestHeaders).reduce((acc, h) => { acc[h.name] = h.value; return acc; }, {}) : {}),
+		...(params.headers || {}),
+	};
+	for (const key of Object.keys(headers)) {
+		// HTTP/2 pseudo-headers (`:authority`, `:path`, …) and the hop-by-hop /
+		// browser-owned headers cannot be set from `fetch`; keeping them made the
+		// replay die with "Invalid name" before it ever left the page.
+		if (key.startsWith(':')) { delete headers[key]; continue; }
+		if (/^(content-length|host|connection|cookie|origin|referer|accept-encoding)$/i.test(key) && !(params.headers && key in params.headers)) delete headers[key];
+	}
+	const body = params.body !== undefined ? params.body : (base && base.postData);
+	const init = { method, headers, credentials: 'include', redirect: 'follow' };
+	if (body !== undefined && body !== null && method !== 'GET' && method !== 'HEAD') init.body = String(body);
+	const expression = `(async () => {
+		const init = ${JSON.stringify(init)};
+		try {
+			const res = await fetch(${JSON.stringify(url)}, init);
+			const text = await res.text();
+			return JSON.stringify({
+				ok: true, status: res.status, statusText: res.statusText, finalUrl: res.url,
+				headers: [...res.headers.entries()],
+				bytes: text.length,
+				body: text.length > ${REPLAY_MAX_BYTES} ? text.slice(0, ${REPLAY_MAX_BYTES}) + '…(truncated)' : text,
+			});
+		} catch (e) { return JSON.stringify({ ok: false, error: String(e) }); }
+	})()`;
+	const res = await withCDP(tab.id, (send) => send('Runtime.evaluate', {
+		expression, awaitPromise: true, returnByValue: true, userGesture: true,
+	}));
+	if (res.exceptionDetails) throw new Error(`replay threw: ${res.exceptionDetails.exception?.description || res.exceptionDetails.text}`);
+	const parsed = JSON.parse(res.result.value);
+	return { tabId: tab.id, replayOf: params.requestId || null, request: { url, method, headerNames: Object.keys(headers), bodyBytes: init.body ? utf8ByteLength(init.body) : 0 }, ...parsed };
+}
+
+/** Source injected into the page to record fetch/XHR calls from JS-land. */
+const HOOK_SOURCE = `(() => {
+	if (window.__DSH_HOOK__ && window.__DSH_HOOK__.version === 1) return 'already';
+	const MAX = 1000, MAXBODY = 200000;
+	const cut = (v) => {
+		if (v === undefined || v === null) return v;
+		let s;
+		try { s = typeof v === 'string' ? v : JSON.stringify(v); } catch (e) { s = String(v); }
+		return typeof s === 'string' && s.length > MAXBODY ? s.slice(0, MAXBODY) + '…(truncated)' : s;
+	};
+	const store = { version: 1, installedAt: Date.now(), records: [] };
+	const push = (r) => { store.records.push(r); if (store.records.length > MAX) store.records.shift(); };
+	const origFetch = window.fetch;
+	const origOpen = XMLHttpRequest.prototype.open;
+	const origSend = XMLHttpRequest.prototype.send;
+	const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+	window.fetch = function (input, init) {
+		const rec = {
+			kind: 'fetch', t: Date.now(),
+			url: typeof input === 'string' ? input : (input && input.url) || '',
+			method: ((init && init.method) || (input && input.method) || 'GET').toUpperCase(),
+			headers: cut((init && init.headers) || (input && input.headers) || null),
+			body: cut(init && init.body),
+		};
+		push(rec);
+		const started = Date.now();
+		return origFetch.apply(this, arguments).then((res) => {
+			rec.status = res.status;
+			rec.ms = Date.now() - started;
+			try {
+				res.clone().text().then((text) => { rec.response = cut(text); }).catch((e) => { rec.responseError = String(e); });
+			} catch (e) { rec.responseError = String(e); }
+			return res;
+		}, (err) => { rec.error = String(err); rec.ms = Date.now() - started; throw err; });
+	};
+	XMLHttpRequest.prototype.open = function (method, url) {
+		this.__dshHook = { kind: 'xhr', t: Date.now(), method: String(method).toUpperCase(), url: String(url), headers: {} };
+		return origOpen.apply(this, arguments);
+	};
+	XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+		if (this.__dshHook) this.__dshHook.headers[name] = value;
+		return origSetHeader.apply(this, arguments);
+	};
+	XMLHttpRequest.prototype.send = function (body) {
+		const rec = this.__dshHook || { kind: 'xhr', t: Date.now(), method: 'GET', url: '', headers: {} };
+		rec.body = cut(body);
+		const started = Date.now();
+		push(rec);
+		this.addEventListener('loadend', () => {
+			try {
+				rec.status = this.status;
+				rec.ms = Date.now() - started;
+				rec.response = cut(this.responseType === '' || this.responseType === 'text' ? this.responseText : '[' + this.responseType + ' body not captured]');
+			} catch (e) { rec.responseError = String(e); }
+		});
+		return origSend.apply(this, arguments);
+	};
+	store.originals = { fetch: origFetch, open: origOpen, send: origSend, setRequestHeader: origSetHeader };
+	store.restore = function () {
+		if (origFetch) window.fetch = origFetch;
+		XMLHttpRequest.prototype.open = origOpen;
+		XMLHttpRequest.prototype.send = origSend;
+		XMLHttpRequest.prototype.setRequestHeader = origSetHeader;
+		store.restored = true;
+	};
+	window.__DSH_HOOK__ = store;
+	return 'installed';
+})()`;
+
+async function evalJson(tabId, expression) {
+	const res = await withCDP(tabId, (send) => send('Runtime.evaluate', {
+		expression, awaitPromise: true, returnByValue: true, userGesture: true,
+	}));
+	if (res.exceptionDetails) throw new Error(`page exception: ${res.exceptionDetails.exception?.description || res.exceptionDetails.text}`);
+	return res.result.value;
+}
+
+async function cmdHookInstall(params) {
+	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
+	const st = ensureDebuggerState(tab.id);
+	const status = await evalJson(tab.id, HOOK_SOURCE);
+	let persistId = st.hookScriptId || null;
+	if (params.persist !== false) {
+		const res = await withCDP(tab.id, (send) => send('Page.addScriptToEvaluateOnNewDocument', { source: HOOK_SOURCE }));
+		persistId = res.identifier || null;
+		st.hookScriptId = persistId;
+	}
+	return { tabId: tab.id, status, persistent: params.persist !== false, identifier: persistId };
+}
+
+async function cmdHookLog(params) {
+	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
+	const limit = Math.min(1_000, Math.max(1, Number(params.limit) || 100));
+	const raw = await evalJson(tab.id, `(() => {
+		const s = window.__DSH_HOOK__;
+		if (!s) return JSON.stringify({ installed: false, total: 0, records: [] });
+		return JSON.stringify({ installed: true, total: s.records.length, installedAt: s.installedAt, restored: Boolean(s.restored), records: s.records.slice(-${limit}) });
+	})()`);
+	const parsed = JSON.parse(raw);
+	let records = parsed.records || [];
+	if (params.urlPattern) {
+		const re = new RegExp(String(params.urlPattern), 'i');
+		records = records.filter((r) => re.test(r.url || ''));
+	}
+	if (params.kind) records = records.filter((r) => r.kind === params.kind);
+	if (params.clear === true) await evalJson(tab.id, '(() => { if (window.__DSH_HOOK__) window.__DSH_HOOK__.records.length = 0; return true; })()');
+	return { tabId: tab.id, ...parsed, count: records.length, records };
+}
+
+async function cmdHookRestore(params) {
+	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
+	const st = ensureDebuggerState(tab.id);
+	const out = await evalJson(tab.id, '(() => { const s = window.__DSH_HOOK__; if (!s || !s.restore) return "not-installed"; s.restore(); return "restored"; })()');
+	if (st.hookScriptId) {
+		await withCDP(tab.id, (send) => send('Page.removeScriptToEvaluateOnNewDocument', { identifier: st.hookScriptId })).catch(() => {});
+		st.hookScriptId = null;
+	}
+	return { tabId: tab.id, status: out, persistent: false };
+}
+
 const COMMANDS = {
 	ping: cmdPing, 'browser.info': cmdBrowserInfo,
 	'tabs.list': cmdTabsList, 'tabs.open': cmdTabsOpen, 'tabs.close': cmdTabsClose, 'tabs.activate': cmdTabsActivate,
@@ -1178,6 +2604,23 @@ const COMMANDS = {
 	wait: cmdWait, dialog: cmdDialogPolicy,
 	'console.log': cmdConsoleLog, 'network.log': cmdNetworkLog, 'network.clear': cmdNetworkClear,
 	pdf: cmdPdf, emulate: cmdEmulate,
+	// Interface analysis + JS reverse engineering (v1.0.9).
+	cdp: cmdCdp, 'targets.list': cmdTargetsList, 'targets.autoattach': cmdTargetsAutoAttach,
+	'bodies.policy': cmdBodiesPolicy, 'network.body': cmdNetworkBody, 'network.har': cmdNetworkHar,
+	'network.replay': cmdNetworkReplay,
+	'cookies.get': cmdCookiesGet, 'cookies.set': cmdCookiesSet,
+	'cookies.delete': cmdCookiesDelete, 'cookies.clear': cmdCookiesClear,
+	'ws.log': cmdWsLog,
+	'scripts.list': cmdScriptsList, 'scripts.source': cmdScriptsSource,
+	'debugger.enable': cmdDebuggerEnable, 'debugger.break': cmdDebuggerBreak,
+	'debugger.unbreak': cmdDebuggerUnbreak, 'debugger.hook': cmdDebuggerHook,
+	'debugger.pause': cmdDebuggerPause, 'debugger.resume': cmdDebuggerResume,
+	'debugger.step': cmdDebuggerStep, 'debugger.state': cmdDebuggerState,
+	'debugger.eval': cmdDebuggerEval, 'debugger.exceptions': cmdDebuggerExceptions,
+	'fetch.enable': cmdFetchEnable, 'fetch.disable': cmdFetchDisable, 'fetch.list': cmdFetchList,
+	'fetch.continue': cmdFetchContinue, 'fetch.fulfill': cmdFetchFulfill, 'fetch.fail': cmdFetchFail,
+	'fetch.body': cmdFetchBody, 'fetch.auth': cmdFetchAuth,
+	'hook.install': cmdHookInstall, 'hook.log': cmdHookLog, 'hook.restore': cmdHookRestore,
 };
 
 /**
@@ -1187,6 +2630,7 @@ const COMMANDS = {
  */
 async function cmdWait(params) {
 	const tab = await resolveTab(params.tabId);
+	assertNotPaused(tab.id);
 	const timeoutMs = Math.min(120_000, Math.max(100, Number(params.timeoutMs) || 15_000));
 	let condition;
 	if (params.selector) {

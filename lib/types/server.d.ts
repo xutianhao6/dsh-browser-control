@@ -52,6 +52,8 @@ export interface CleanupResult {
     readonly shotsRemoved: number;
     /** Scratch files deleted (agent temp scripts/artifacts matched by convention). */
     readonly scratchRemoved: readonly string[];
+    /** Artifact subdirectory trees removed (HAR exports, script dumps, sourcemap trees). */
+    readonly subdirsRemoved: readonly string[];
 }
 export interface BridgeServerOptions {
     readonly port: number;
@@ -65,14 +67,19 @@ export interface BridgeServerOptions {
 }
 /**
  * Clear the screenshots directory and delete agent scratch files. Only the
- * top level of each location is touched; nested trees stay untouched.
+ * top level of each location is touched, except for the named artifact
+ * subdirectories (HAR exports, script dumps, sourcemap trees), which are
+ * removed whole — they are generated trees this plugin owns.
  * @param options - `shotsDir` is cleared of direct file children; `scratchDir`
- *   defaults to the process working directory and loses only scratch-named files.
+ *   defaults to the process working directory and loses only scratch-named
+ *   files; `artifactSubdirs` names subdirectories of `shotsDir` to delete
+ *   recursively.
  * @returns counts and names of what was removed.
  */
 export declare function cleanupArtifacts(options: {
     shotsDir: string;
     scratchDir?: string;
+    artifactSubdirs?: readonly string[];
 }): Promise<CleanupResult>;
 /**
  * One live bridge endpoint. Start/stop may cycle repeatedly on one instance;
@@ -110,6 +117,22 @@ export declare class BridgeServer {
     private log;
     private handleHttp;
     private respondJson;
+    /**
+     * Authorize a state-changing HTTP call.
+     *
+     * Two independent gates, because the listener is reachable by every local
+     * process and by any page a browser happens to have open:
+     *  1. the bridge token must match (header `X-DSH-Token` or `?token=`), and
+     *  2. a request that carries a browser `Origin` must come from an extension
+     *     origin — otherwise a random website could POST to 127.0.0.1:<port> and
+     *     drive the user's logged-in browser.
+     * Command-line callers (curl, PowerShell, node fetch) send no Origin and pass
+     * gate 2 by construction.
+     * @param req - incoming request.
+     * @param url - parsed request URL, carrying the optional `token` query.
+     * @returns whether the request may proceed.
+     */
+    private authorize;
     private handleCommandRequest;
     private handleUpgrade;
     private handleFrame;

@@ -49,7 +49,17 @@ powershell -ExecutionPolicy Bypass -File <仓库目录>\scripts\install.ps1
 powershell -ExecutionPolicy Bypass -File <仓库目录>\scripts\verify-install.ps1
 ```
 
-它会通过桥的 HTTP 面下发真实命令，逐项验收：桥在监听 → 扩展已连接 → **扩展版本 = 仓库版本** → `ping` → `tabs.list` → `eval` 里 `await` 400ms（旧版有 100ms 隐形超时，这一项会挂）→ `content` 读当前页 → 「浏览器操作」模式存在 → `launch` 配置就位。全绿退出码 0。
+它会通过桥的 HTTP 面下发真实命令，逐项验收：桥在监听 → 扩展已连接 → **扩展版本 = 仓库版本** → `ping` → `tabs.list` → 打开验收标签页（`chrome://` 页面挂不上调试器）→ `eval` 里 `await` 400ms（旧版有 100ms 隐形超时，这一项会挂）→ `content` 读当前页 → 接口分析 / JS 逆向能力（`cdp` / `cookies.get` / `network.log` / `network.har` / `ws.log` / `scripts.list` / `debugger.state` / `fetch.list` / `hook.log`，以及「不带 token 应被拒」）→ 「浏览器操作」模式存在 → `launch` 配置就位。全绿退出码 0。
+
+> 「不带 token 应被拒」失败 = 运行中的 dsh 还加载着旧版插件代码（桥的 token 门是 v1.0.9 新增的）。**重启一次 DSH Desktop** 即可；这一项故意做成失败而不是跳过，就是这个用途。
+
+### 3b. 逆向能力的深度验收（可选但推荐）
+
+```powershell
+node <仓库目录>\scripts\verify-reverse.mjs
+```
+
+它自带本地夹具服务器（页面 / JSON 接口 / 401 Basic 挑战 / 带 sourcemap 的 JS），**离线可跑**，不需要外网站点。它加载构建产物、对 10 个逆向工具发真实调用，并用 dsh-tools 的校验器同时校验每次调用的入参 schema 与返回值 schema。前置：跑过 `npm run build`、桥在监听、扩展已连接。加 `--keep` 可保留落盘产物（HAR / 脚本 / sourcemap 树）人工检查。
 
 失败时按脚本给出的提示处理，常见情况见下表。
 

@@ -19,7 +19,7 @@
 import http from 'node:http'
 import type net from 'node:net'
 import { randomUUID, createHash } from 'node:crypto'
-import { mkdir, readdir, rm } from 'node:fs/promises'
+import { mkdir, readdir, rm, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { encodeCloseFrame, encodeControlFrame, encodeTextFrame, FrameReader } from './ws.ts'
 
@@ -62,6 +62,8 @@ export interface CleanupResult {
   readonly shotsRemoved: number
   /** Scratch files deleted (agent temp scripts/artifacts matched by convention). */
   readonly scratchRemoved: readonly string[]
+  /** Artifact subdirectory trees removed (HAR exports, script dumps, sourcemap trees). */
+  readonly subdirsRemoved: readonly string[]
 }
 
 interface PendingEntry {
@@ -88,12 +90,20 @@ const SCRATCH_FILE_PATTERN = /^__[^/\\]+\.(mjs|cjs|js|png|jpg|jpeg)$/i
 
 /**
  * Clear the screenshots directory and delete agent scratch files. Only the
- * top level of each location is touched; nested trees stay untouched.
+ * top level of each location is touched, except for the named artifact
+ * subdirectories (HAR exports, script dumps, sourcemap trees), which are
+ * removed whole — they are generated trees this plugin owns.
  * @param options - `shotsDir` is cleared of direct file children; `scratchDir`
- *   defaults to the process working directory and loses only scratch-named files.
+ *   defaults to the process working directory and loses only scratch-named
+ *   files; `artifactSubdirs` names subdirectories of `shotsDir` to delete
+ *   recursively.
  * @returns counts and names of what was removed.
  */
-export async function cleanupArtifacts(options: { shotsDir: string; scratchDir?: string }): Promise<CleanupResult> {
+export async function cleanupArtifacts(options: {
+	shotsDir: string
+	scratchDir?: string
+	artifactSubdirs?: readonly string[]
+}): Promise<CleanupResult> {
 	await mkdir(options.shotsDir, { recursive: true })
 	const shotsEntries = await readdir(options.shotsDir, { withFileTypes: true })
 	let shotsRemoved = 0
@@ -101,6 +111,17 @@ export async function cleanupArtifacts(options: { shotsDir: string; scratchDir?:
 		if (!entry.isFile()) continue
 		await rm(path.join(options.shotsDir, entry.name))
 		shotsRemoved += 1
+	}
+	const subdirsRemoved: string[] = []
+	for (const name of options.artifactSubdirs ?? []) {
+		// Only a plain directory name may be targeted: a caller-supplied path
+		// with separators could otherwise delete anything on disk.
+		if (name.length === 0 || name.includes('/') || name.includes('\\') || name === '.' || name === '..') continue
+		const target = path.join(options.shotsDir, name)
+		const info = await stat(target).catch(() => null)
+		if (info === null || !info.isDirectory()) continue
+		await rm(target, { recursive: true, force: true })
+		subdirsRemoved.push(name)
 	}
 	const scratchDir = options.scratchDir ?? process.cwd()
 	const scratchEntries = await readdir(scratchDir, { withFileTypes: true }).catch(() => [])
@@ -110,7 +131,7 @@ export async function cleanupArtifacts(options: { shotsDir: string; scratchDir?:
 		await rm(path.join(scratchDir, entry.name))
 		scratchRemoved.push(entry.name)
 	}
-	return { shotsRemoved, scratchRemoved }
+	return { shotsRemoved, scratchRemoved, subdirsRemoved }
 }
 
 /**
@@ -267,7 +288,7 @@ export class BridgeServer {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST',
-        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Headers': 'Content-Type, X-DSH-Token',
       })
       res.end()
       return
@@ -277,6 +298,10 @@ export class BridgeServer {
       return
     }
     if (url.pathname === '/api/cleanup' && req.method === 'POST') {
+      if (!this.authorize(req, url)) {
+        this.respondJson(res, 401, { ok: false, error: 'unauthorized: send the bridge token in the X-DSH-Token header or ?token=' })
+        return
+      }
       void this.cleanup().then(
         (result) => this.respondJson(res, 200, { ok: true, ...result }),
         (error) => this.respondJson(res, 500, { ok: false, error: errorMessage(error) }),
@@ -284,6 +309,10 @@ export class BridgeServer {
       return
     }
     if (url.pathname === '/api/command' && req.method === 'POST') {
+      if (!this.authorize(req, url)) {
+        this.respondJson(res, 401, { ok: false, error: 'unauthorized: send the bridge token in the X-DSH-Token header or ?token=' })
+        return
+      }
       this.handleCommandRequest(req, res)
       return
     }
@@ -301,6 +330,30 @@ export class BridgeServer {
       'Access-Control-Allow-Origin': '*',
     })
     res.end(JSON.stringify(body))
+  }
+
+  /**
+   * Authorize a state-changing HTTP call.
+   *
+   * Two independent gates, because the listener is reachable by every local
+   * process and by any page a browser happens to have open:
+   *  1. the bridge token must match (header `X-DSH-Token` or `?token=`), and
+   *  2. a request that carries a browser `Origin` must come from an extension
+   *     origin — otherwise a random website could POST to 127.0.0.1:<port> and
+   *     drive the user's logged-in browser.
+   * Command-line callers (curl, PowerShell, node fetch) send no Origin and pass
+   * gate 2 by construction.
+   * @param req - incoming request.
+   * @param url - parsed request URL, carrying the optional `token` query.
+   * @returns whether the request may proceed.
+   */
+  private authorize(req: http.IncomingMessage, url: URL): boolean {
+    const origin = req.headers.origin
+    if (typeof origin === 'string' && origin.length > 0 && !origin.startsWith('chrome-extension://')) return false
+    const header = req.headers['x-dsh-token']
+    const supplied = Array.isArray(header) ? header[0] : header
+    const token = (supplied ?? url.searchParams.get('token') ?? '').trim()
+    return token.length > 0 && token === this.options.token
   }
 
   private handleCommandRequest(req: http.IncomingMessage, res: http.ServerResponse): void {

@@ -5,7 +5,7 @@ Chrome 浏览器扩展 + DeepSeek Harness 插件，让 AI Agent 通过 CDP 驱�
 ## 文件结构
 
 - `extension/` - Chrome MV3 扩展（background.js Service Worker + popup UI）
-- `plugin/` - DeepSeek Harness 插件（WebSocket 桥 + browser_* 工具）
+- `src/` - DeepSeek Harness 插件（WebSocket 桥 + browser_* 工具）
 - `install.sh` - 一键安装脚本
 - `cordis.patch.yml` - 插件挂载配置
 - `dsh-config/` - dsh 接入说明
@@ -21,8 +21,16 @@ Chrome 浏览器扩展 + DeepSeek Harness 插件，让 AI Agent 通过 CDP 驱�
 
 ## 关键文件
 
-- `plugin/src/index.ts` - 11 个 browser_* 工具注册
-- `plugin/src/server.ts` - WebSocket 服务 + HTTP 面 + 状态页
-- `plugin/src/ws.ts` - RFC 6455 帧编解码
+- `src/index.ts` - 自动化类 browser_* 工具注册 + 插件装配
+- `src/reverse.ts` - 接口分析 / JS 逆向类 browser_* 工具注册（v1.0.9）
+- `src/server.ts` - WebSocket 服务 + HTTP 面（`/api/command`、`/api/cleanup` 需 token）+ 状态页
+- `src/ws.ts` - RFC 6455 帧编解码
+- `scripts/verify-reverse.mjs` - 逆向能力验收（自带本地夹具：页面 / JSON 接口 / 401 Basic 挑战 / 带 sourcemap 的 JS，离线可跑；校验入参与返回值 schema）
 - `extension/background.js` - CDP 命令分发 + 持久 debugger 附着
 - `extension/popup.js` - 弹窗状态 UI
+
+## browser_* 工具
+
+- 自动化：navigate / read / snapshot / click / type / press / scroll / tabs / evaluate / screenshot / console_log / network_log / network_clear / pdf / emulate / cleanup
+- 接口分析 / JS 逆向（v1.0.9）：cdp / cookies / network_body / network_har / network_replay / websocket_log / scripts / debugger / intercept / hook
+- 值得记的：`cdp` 是任意 CDP 方法的逃生口（浏览器级 `Browser.*` 域被 Chrome 拒绝，属正常）；`cookies` 走 CDP 所以能读 HttpOnly；HAR entry 带 `_requestId`，可回灌 `network_body` / `network_replay`（`bodyCached` 只在 network_log 的行上）；`debugger.hook` 在函数被调用时断下抓真实入参；`intercept` 的 hold 会挂住页面，用完必须 disable；断点暂停期间 DOM/JS 类命令报 tab_paused；`cleanup` 删截图/PDF + 三棵产物树（har/scripts/sourcemaps）+ `__` 前缀临时文件；网络缓冲只从 attach 那一刻开始，`tabs.open` / `navigate` 会先 attach 再导航，所以整段加载（含文档请求）都能抓到
