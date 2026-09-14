@@ -163,7 +163,8 @@ After installing and restarting, the bridge is on by default (v1.0.6+); no manua
 ### Option C: copy into the harness tree (legacy, v1.0.2 and earlier)
 
 ```bash
-git clone https://github.com/xutianhao6/dsh-browser-control.git
+# the legacy layout only exists upstream (this fork's baseline is v1.0.7), hence the upstream clone
+git clone https://github.com/caob23/dsh-browser-control.git
 cd dsh-browser-control
 git checkout v1.0.2   # legacy layout lives at the v1.0.2 tag
 ./install.sh /path/to/deepseek-harness

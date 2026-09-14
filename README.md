@@ -162,7 +162,8 @@ dsh plugin --profile web remove @caob23/dsh-browser-control
 ### 方式 C：复制进 harness 源码树（旧方式，v1.0.2 及以前）
 
 ```bash
-git clone https://github.com/xutianhao6/dsh-browser-control.git
+# 旧布局只存在于上游仓库（本 fork 的基线是 v1.0.7），所以这里 clone 上游
+git clone https://github.com/caob23/dsh-browser-control.git
 cd dsh-browser-control
 git checkout v1.0.2   # 旧布局在 v1.0.2 tag
 ./install.sh /你的路径/deepseek-harness

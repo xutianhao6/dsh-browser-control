@@ -32,5 +32,6 @@ Chrome 浏览器扩展 + DeepSeek Harness 插件，让 AI Agent 通过 CDP 驱�
 ## browser_* 工具
 
 - 自动化：navigate / read / snapshot / click / type / press / scroll / tabs / evaluate / screenshot / console_log / network_log / network_clear / pdf / emulate / cleanup
-- 接口分析 / JS 逆向（v1.0.9）：cdp / cookies / network_body / network_har / network_replay / websocket_log / scripts / debugger / intercept / hook
-- 值得记的：`cdp` 是任意 CDP 方法的逃生口（浏览器级 `Browser.*` 域被 Chrome 拒绝，属正常）；`cookies` 走 CDP 所以能读 HttpOnly；HAR entry 带 `_requestId`，可回灌 `network_body` / `network_replay`（`bodyCached` 只在 network_log 的行上）；`debugger.hook` 在函数被调用时断下抓真实入参；`intercept` 的 hold 会挂住页面，用完必须 disable；断点暂停期间 DOM/JS 类命令报 tab_paused；`cleanup` 删截图/PDF + 三棵产物树（har/scripts/sourcemaps）+ `__` 前缀临时文件；网络缓冲只从 attach 那一刻开始，`tabs.open` / `navigate` 会先 attach 再导航，所以整段加载（含文档请求）都能抓到
+- 接口分析 / JS 逆向（v1.0.9，12 个）：cdp / cookies / body_policy / targets / network_body / network_har / network_replay / websocket_log / scripts / debugger / intercept / hook
+- 值得记的：`cdp` 是任意 CDP 方法的逃生口（浏览器级 `Browser.*` 域与 `Target.getTargets` 被 Chrome 拒绝，属正常；`Target.setAutoAttach` 可用）；页面专用 worker 不在 target 列表里，先用 `targets {autoAttach:true}` 让 Chrome 报出来，再把 `targetId` 交给 `cdp {targetId}` 进 worker 求值 / 开 Debugger 域 / 热改代码；`body_policy` 管响应体后台捕获（off|xhr|all），否则 body 一过就取不到；`cookies` 走 CDP 所以能读 HttpOnly；HAR entry 带 `_requestId`，可回灌 `network_body` / `network_replay`（`bodyCached` 只在 network_log 的行上）；`debugger.hook` 在函数被调用时断下抓真实入参；`intercept` 的 hold 会挂住页面，用完必须 disable（`hold:false` 才是只观察并自动放行）；断点暂停期间 DOM/JS 类命令报 tab_paused；`cleanup` 删截图/PDF + 三棵产物树（har/scripts/sourcemaps）+ `__` 前缀临时文件；网络缓冲只从 attach 那一刻开始，`tabs.open` / `navigate` 会先 attach 再导航，所以整段加载（含文档请求）都能抓到
+- 逆向能力离线验收：`node scripts/verify-reverse.mjs`（自带夹具，同时校验入参与返回值 schema；`--keep` 保留落盘产物）

@@ -51,7 +51,7 @@ Chrome 对非前台标签页的 `setTimeout` 强制钳制到 ≥1s。长任务�
 
 ## 逆向能力的行为契约（v1.0.9）
 
-接口分析 / JS 逆向这套工具（`cdp` / `cookies.*` / `network.body|har|replay` / `ws.log` / `scripts.*` / `debugger.*` / `fetch.*` / `hook.*`）的确定语义：
+接口分析 / JS 逆向这套工具（`cdp` / `cookies.*` / `bodies.policy` / `targets.*` / `network.body|har|replay` / `ws.log` / `scripts.*` / `debugger.*` / `fetch.*` / `hook.*`）的确定语义：
 
 - **模型只看到 `render` 文本**：DSH 的工具结果只把 `output.render` 生成的文本交给模型，规范值仅用于 schema 校验、不单独投递。所以每个数据类工具的 render 都必须携带载荷（页面正文 / 元素 ref / 请求行 / 脚本源码 / 调用帧 / 响应体），超长时给出明确的截断提示；`scripts/verify-reverse.mjs` 每次工具调用都会断言这一点。改工具时**只改 render 文案而丢掉载荷**＝该工具对模型失效。
 
@@ -66,4 +66,5 @@ Chrome 对非前台标签页的 `setTimeout` 强制钳制到 ≥1s。长任务�
 - **`sourcemap` 不伪造源码**：只有 `.map` 里真的带 `sourcesContent` 的条目才会写出文件，其余记 `missing`；`.map` 本身取不到时返回 `error`（附 `mapUrl`），不会写出空文件冒充还原结果。
 - **抓包窗口从 attach 那一刻开始**：`Network.*` 事件只在扩展持有该标签页的调试器附着时才产生，附着之前发生的请求不在缓冲区里。`nav` 与 `tabs.open` 因此**先挂调试器再导航**（`tabs.open` 先开 `about:blank`、attach、再跳到目标 URL），整段加载连同文档请求都会被捕获。用户手动打开的标签页只能从扩展第一次附着（通常是 `eval` / `content` / `scripts.*` 等任意 CDP 命令）之后开始记；要完整抓一次加载，用 `browser_navigate`。
 - **按需取体自带自愈**：`network.body` 可能是一个标签页上的第一条 CDP 调用，它会自己完成附着（失败还会重挂一次重试），不会出现 `Debugger is not attached`；真正的错误（例如 requestId 不存在）如实返回 Chrome 原文 `No resource with given identifier found`，并附 `unavailable: true`。
-- **`cdp` 的域边界**：`chrome.debugger` 不暴露浏览器级域，`Browser.*`（如 `Browser.getVersion`）返回 `-32601 ... wasn't found` —— 这是 Chrome 的限制，不是封装缺失。`Network.*` / `Storage.*` / `DOM.*` / `Runtime.*` / `Debugger.*` / `Fetch.*` / `Emulation.*` / `Target.*` 等均可用。
+- **`cdp` 的域边界**：`chrome.debugger` 客户端拿不到浏览器级域 —— `Browser.*`（如 `Browser.getVersion`）返回 `-32601 ... wasn't found`，`Target.getTargets` 返回 `-32000 Not allowed`，这是 Chrome 的限制、不是封装缺失。`Network.*` / `Storage.*` / `DOM.*` / `Runtime.*` / `Debugger.*` / `Fetch.*` / `Emulation.*` 以及 `Target.setAutoAttach` 均可用（实测 `Target.setAutoAttach` 允许，返回成功）。
+- **发现 target 只能靠 `targets.list` + auto-attach**：**页面的专用 Worker（含 blob worker）完全不出现在 `chrome.debugger.getTargets()` 里**，`targets.list` 的静态部分也列不到它 —— 必须先 `targets.autoattach`（即 `browser_targets {autoAttach: true}`，底层 `Target.setAutoAttach {autoAttach, waitForDebuggerOnStart, flatten: true}`），Chrome 才会以 `Target.attachedToTarget` 把它报出来，此时它带 `source: 'Target auto-attach'`、`attached: true` 与 `sessionId`；静态列表里的行 `source` 是 `chrome.debugger.getTargets`。`autoAttach:false` 会关掉并把该标签页已登记的 target 清空。拿到 `targetId` 后交给 `cdp {targetId}` 就能在该 target 上 `Runtime.evaluate` / `Debugger.enable` / 热改代码；`targets.list` 的 `tabId`/`type` 过滤对 auto-attach 报出来的 target 也生效。
