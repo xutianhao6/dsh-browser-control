@@ -9,14 +9,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/caob23/dsh-browser-control/releases"><img src="https://img.shields.io/github/v/release/caob23/dsh-browser-control" alt="release"></a>
-  <a href="https://github.com/caob23/dsh-browser-control/blob/main/LICENSE"><img src="https://img.shields.io/github/license/caob23/dsh-browser-control" alt="license"></a>
+  <a href="https://github.com/xutianhao6/dsh-browser-control/releases"><img src="https://img.shields.io/github/v/release/xutianhao6/dsh-browser-control" alt="release"></a>
+  <a href="https://github.com/xutianhao6/dsh-browser-control/blob/main/LICENSE"><img src="https://img.shields.io/github/license/xutianhao6/dsh-browser-control" alt="license"></a>
   <a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a>
   <a href="https://developer.chrome.com/docs/extensions/develop/migrate/mv2-deprecation-timeline"><img src="https://img.shields.io/badge/Chrome-MV3-yellow" alt="chrome mv3"></a>
   <a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/DSH-Plugin-purple" alt="dsh plugin"></a>
   <img src="https://img.shields.io/badge/CDP-powered-orange" alt="cdp">
-  <img src="https://img.shields.io/badge/tools-16-red" alt="16 browser tools">
-  <img src="https://img.shields.io/badge/tests-29%2F29-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tools-28-red" alt="28 browser tools">
+  <img src="https://img.shields.io/badge/tests-passing-brightgreen" alt="tests">
 </p>
 
 Chrome 浏览器扩展 + DeepSeek Harness 插件，让 AI Agent 像人一样操控你的真实浏览器。
@@ -27,7 +27,7 @@ Chrome 浏览器扩展 + DeepSeek Harness 插件，让 AI Agent 像人一样操�
 
 ## 本 fork 的改动
 
-fork 自 [caob23/dsh-browser-control](https://github.com/caob23/dsh-browser-control)，基线 v1.0.7。以下是本 fork 相对上游的全部改动（**v1.0.8**）：
+fork 自 [caob23/dsh-browser-control](https://github.com/caob23/dsh-browser-control)，基线 v1.0.7。以下是本 fork 相对上游的全部改动（**v1.0.9**）：
 
 | 改动 | 说明 |
 |---|---|
@@ -77,8 +77,8 @@ Chrome 扩展（CDP 驱动）
 
 | 文件 | 说明 |
 |---|---|
-| [DSH-Browser-Control-1.0.8.zip](https://github.com/caob23/dsh-browser-control/releases/download/v1.0.8/DSH-Browser-Control-1.0.8.zip) | Chrome 扩展（解压后加载） |
-| [dsh-browser-control-plugin-v1.0.8.zip](https://github.com/caob23/dsh-browser-control/releases/download/v1.0.8/dsh-browser-control-plugin-v1.0.8.zip) | dsh 插件（离线兜底，在线装直接用方式 A/B） |
+| [DSH-Browser-Control-1.0.9.zip](https://github.com/xutianhao6/dsh-browser-control/releases/download/v1.0.9/DSH-Browser-Control-1.0.9.zip) | Chrome 扩展（解压后加载） |
+| [dsh-browser-control-plugin-v1.0.9.zip](https://github.com/xutianhao6/dsh-browser-control/releases/download/v1.0.9/dsh-browser-control-plugin-v1.0.9.zip) | dsh 插件（离线兜底，在线装直接用方式 A/B） |
 
 ## 一键安装（推荐）
 
@@ -140,7 +140,7 @@ npm install @caob23/dsh-browser-control
 
 ```bash
 # 直接从 GitHub 安装
-dsh plugin --profile web add "github:caob23/dsh-browser-control#v1.0.8"
+dsh plugin --profile web add "github:xutianhao6/dsh-browser-control#v1.0.9"
 
 # 本地目录调试（注意：必须显式 file: 前缀）
 dsh plugin --profile web add "file:D:\path\to\dsh-browser-control"
@@ -159,12 +159,10 @@ dsh plugin --profile web remove @caob23/dsh-browser-control
 
 > 想关掉默认开启：在 `~/.dsh/settings.yaml` 里写 `browser-bridge: { enabled: false }` 即可。
 
-<!-- fork 提示（渲染时不可见）：徽章与下载链接目前指向上游仓库；发布时把 caob23/dsh-browser-control 换成你自己的用户名/仓库名。 -->
-
 ### 方式 C：复制进 harness 源码树（旧方式，v1.0.2 及以前）
 
 ```bash
-git clone https://github.com/caob23/dsh-browser-control.git
+git clone https://github.com/xutianhao6/dsh-browser-control.git
 cd dsh-browser-control
 git checkout v1.0.2   # 旧布局在 v1.0.2 tag
 ./install.sh /你的路径/deepseek-harness

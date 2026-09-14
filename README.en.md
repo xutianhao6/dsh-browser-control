@@ -9,14 +9,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/caob23/dsh-browser-control/releases"><img src="https://img.shields.io/github/v/release/caob23/dsh-browser-control" alt="release"></a>
-  <a href="https://github.com/caob23/dsh-browser-control/blob/main/LICENSE"><img src="https://img.shields.io/github/license/caob23/dsh-browser-control" alt="license"></a>
+  <a href="https://github.com/xutianhao6/dsh-browser-control/releases"><img src="https://img.shields.io/github/v/release/xutianhao6/dsh-browser-control" alt="release"></a>
+  <a href="https://github.com/xutianhao6/dsh-browser-control/blob/main/LICENSE"><img src="https://img.shields.io/github/license/xutianhao6/dsh-browser-control" alt="license"></a>
   <a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a>
   <a href="https://developer.chrome.com/docs/extensions/develop/migrate/mv2-deprecation-timeline"><img src="https://img.shields.io/badge/Chrome-MV3-yellow" alt="chrome mv3"></a>
   <a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/DSH-Plugin-purple" alt="dsh plugin"></a>
   <img src="https://img.shields.io/badge/CDP-powered-orange" alt="cdp">
-  <img src="https://img.shields.io/badge/tools-16-red" alt="16 browser tools">
-  <img src="https://img.shields.io/badge/tests-29%2F29-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tools-28-red" alt="28 browser tools">
+  <img src="https://img.shields.io/badge/tests-passing-brightgreen" alt="tests">
 </p>
 
 A Chrome extension + DeepSeek Harness plugin that lets AI agents drive your real browser like a human.
@@ -27,7 +27,7 @@ A Chrome extension + DeepSeek Harness plugin that lets AI agents drive your real
 
 ## Changes in this fork
 
-Forked from [caob23/dsh-browser-control](https://github.com/caob23/dsh-browser-control) at v1.0.7. Everything this fork changes on top of upstream (**v1.0.8**):
+Forked from [caob23/dsh-browser-control](https://github.com/caob23/dsh-browser-control) at v1.0.7. Everything this fork changes on top of upstream (**v1.0.9**):
 
 | Change | What it does |
 |---|---|
@@ -77,8 +77,8 @@ In one line: **for "use MY browser" tasks (logged-in Bilibili, Zhihu, admin pane
 
 | File | Purpose |
 |---|---|
-| [DSH-Browser-Control-1.0.8.zip](https://github.com/caob23/dsh-browser-control/releases/download/v1.0.8/DSH-Browser-Control-1.0.8.zip) | Chrome extension (unzip and load) |
-| [dsh-browser-control-plugin-v1.0.8.zip](https://github.com/caob23/dsh-browser-control/releases/download/v1.0.8/dsh-browser-control-plugin-v1.0.8.zip) | dsh plugin (offline fallback; online installs use Option A/B) |
+| [DSH-Browser-Control-1.0.9.zip](https://github.com/xutianhao6/dsh-browser-control/releases/download/v1.0.9/DSH-Browser-Control-1.0.9.zip) | Chrome extension (unzip and load) |
+| [dsh-browser-control-plugin-v1.0.9.zip](https://github.com/xutianhao6/dsh-browser-control/releases/download/v1.0.9/dsh-browser-control-plugin-v1.0.9.zip) | dsh plugin (offline fallback; online installs use Option A/B) |
 
 ## One-command install (recommended)
 
@@ -140,7 +140,7 @@ npm install @caob23/dsh-browser-control
 
 ```bash
 # Straight from GitHub
-dsh plugin --profile web add "github:caob23/dsh-browser-control#v1.0.8"
+dsh plugin --profile web add "github:xutianhao6/dsh-browser-control#v1.0.9"
 
 # Local checkout for debugging (note: the explicit file: prefix is required)
 dsh plugin --profile web add "file:D:\path\to\dsh-browser-control"
@@ -160,12 +160,10 @@ After installing and restarting, the bridge is on by default (v1.0.6+); no manua
 
 > To opt out: write `browser-bridge: { enabled: false }` in `~/.dsh/settings.yaml`.
 
-<!-- Fork note (not rendered): the badges and download links still point at the upstream repository; replace caob23/dsh-browser-control with your own owner/repo when publishing. -->
-
 ### Option C: copy into the harness tree (legacy, v1.0.2 and earlier)
 
 ```bash
-git clone https://github.com/caob23/dsh-browser-control.git
+git clone https://github.com/xutianhao6/dsh-browser-control.git
 cd dsh-browser-control
 git checkout v1.0.2   # legacy layout lives at the v1.0.2 tag
 ./install.sh /path/to/deepseek-harness
