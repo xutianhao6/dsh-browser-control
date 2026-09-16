@@ -3,11 +3,11 @@
  * 背景：browser_click 走 CDP Input.dispatchMouseEvent，不会移动系统指针，
  * 用户在浏览器窗口里看不到鼠标，也看不到"这一次点击到底有没有生效"。
  *
- * 用法（Agent 侧的顺序）：
- *   await __dshCursor.clickTo('#submit')     // 1. 光标滑过去 + 波纹（内部会 arm 预期目标）
+ * 用法（Agent 侧的顺序。注意：这些是在 browser_evaluate 里执行的**表达式**，
+ * 工具只 await 表达式返回的 Promise、不会把代码包进 async 函数 —— 写裸 `await` 会 SyntaxError）：
+ *   __dshCursor.clickTo('#submit')            // 1. 光标滑过去 + 波纹；内部会 arm 预期目标并接管这次点击
  *   browser_click(ref)                        // 2. 真实点击，拿到 { clicked:{x,y}, hitVerified, hitInstead }
- *   await __dshCursor.settle({ x, y, hitVerified, hitInstead })
- *                                            // 3. 判定 + 上色：命中=绿，被遮挡/被拦截=红
+ *   __dshCursor.settle({ x, y, hitVerified }) // 3. 判定 + 上色（clickTo 已自动接管；这步只在要结构化结果时调）
  *
  * settle() 会把光标重新锚定到**工具报告的真实点击坐标**（元素可能被 scrollIntoView 挪过），
  * 所以屏幕上的位置始终等于实际点击位置。

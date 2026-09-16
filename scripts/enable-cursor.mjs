@@ -232,7 +232,8 @@ async function main() {
   if (!args.off) {
     say('');
     say(`可见光标 + 命中判定就绪（图层源码 ${sizeKb}KB 由本脚本从磁盘读取，不占用 Agent 上下文）`);
-    say('用法：await __dshCursor.clickTo("<选择器>")  →  browser_click  →  自动判定');
+    say('用法：browser_evaluate 执行 __dshCursor.clickTo("<选择器>")  →  browser_click  →  自动判定');
+    say('      （表达式返回 Promise 即可，工具会 await 它；裸 await 会 SyntaxError。）');
     say('      绿「命中」= 这次点击真的生效；红「被遮挡 / 被拦截 / 事件未到达」= 没生效，');
     say('      红虚线框会圈出真正吃掉点击的元素（先处理它再重试，不要盲目重复点击）。');
   }

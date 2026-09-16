@@ -274,7 +274,8 @@ node scripts\enable-cursor.mjs --off                # remove
 On the agent side it is three steps (the "Browser operations" persona hard-codes them, so you never have to ask):
 
 ```js
-await __dshCursor.clickTo('#submit')   // slide the cursor there + click ripple (use moveTo before typing)
+// inside browser_evaluate (the expression returns a Promise and the tool awaits it; a bare `await` is a SyntaxError):
+__dshCursor.clickTo('#submit')   // slide the cursor there + click ripple (use moveTo before typing)
 // browser_click ...
 // → verdict appears automatically: green "hit"; red "covered / intercepted / no event"
 ```

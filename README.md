@@ -273,7 +273,8 @@ node scripts\enable-cursor.mjs --off                # 卸掉
 Agent 侧是三步（「浏览器操作」模式的人设已经把这段写死，不用你提醒）：
 
 ```js
-await __dshCursor.clickTo('#submit')   // 光标滑过去 + 点击波纹（填表单用 moveTo）
+// browser_evaluate 里执行（表达式返回 Promise，工具会 await 它；裸 await 会 SyntaxError）：
+__dshCursor.clickTo('#submit')   // 光标滑过去 + 点击波纹（填表单用 moveTo）
 // browser_click ...
 // → 自动判定：绿「命中」；红「被遮挡 / 被拦截 / 事件未到达」
 ```
