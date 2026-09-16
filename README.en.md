@@ -288,9 +288,11 @@ __dshCursor.clickTo('#submit')   // slide the cursor there + click ripple (use m
 | `prevented` | A page handler called `preventDefault()` — the tool layer still says `hitVerified: true` | red ✕ + reason |
 | `stopped` | Propagation was cut by `stopPropagation()` | red ✕ + reason |
 
-Why the script delivers the source: handing this 18 KB overlay to the agent to paste into `browser_evaluate` burns tens of thousands of tokens per injection; `enable-cursor.mjs` reads it from disk and registers it through the bridge's HTTP face (`POST /api/command`), so the agent runs one command.
+Why the script delivers the source: handing this ~20 KB overlay to the agent to paste into `browser_evaluate` burns tens of thousands of tokens per injection; `enable-cursor.mjs` reads it from disk and registers it through the bridge's HTTP face (`POST /api/command`), so the agent runs one command.
 
 Injection is two steps, and both matter: `Page.addScriptToEvaluateOnNewDocument` registers it on that tab (later pages inherit it, and DevTools injection is not subject to page CSP) plus `Runtime.evaluate` to make the **current** document work immediately, with no reload.
+
+**It does not vanish**: the position lives in `sessionStorage` (after a same-origin navigation it returns to exactly where it was — verified restoring (400,300)); a cross-origin or first-ever injection parks it in a corner (top-left fallback while the viewport cannot be measured, corrected once it can be); and a resize/maximize pulls it back inside the viewport. So after the page changes you can still see where the mouse is. `--all` injects into every tab at once.
 
 Two bugs found the hard way, both fixed: the warning layer itself must be `pointer-events:none`, otherwise the red dashed box becomes a new obstruction and the tool's pre-check immediately reports `hitVerified:false`; and the auto-verdict timeout must not be shorter than the agent's `evaluate`→`browser_click` round trip (measured >1.5 s), with late clicks able to overturn the timeout's conclusion.
 

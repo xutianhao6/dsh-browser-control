@@ -197,6 +197,44 @@
       // 判定结论一直留着，直到下一次操作（arm/clearWarn）—— 闪一下就没了等于没提示
     }
 
+    // ---------- 位置记忆：换页面、缩放窗口之后光标也不该"消失" ----------
+    // 新文档里图层是从头装的，不恢复位置就只能停在屏幕外，用户看到的就是「鼠标没了」。
+    const POS_KEY = '__dsh_cursor_pos';
+    function loadPos() {
+      try {
+        const v = JSON.parse(sessionStorage.getItem(POS_KEY) || 'null');
+        if (v && Number.isFinite(v.x) && Number.isFinite(v.y)) return v;
+      } catch (_) { /* 沙箱 iframe 里 sessionStorage 可能抛 SecurityError */ }
+      return null;
+    }
+    function savePos(p) {
+      try { sessionStorage.setItem(POS_KEY, JSON.stringify({ x: p.x, y: p.y })); } catch (_) {}
+    }
+    function viewport() {
+      // 未渲染过的后台标签页里 innerWidth / clientWidth 都是 0 —— 这时尺寸不可信，
+      // 只能兜底，并等它变得可测量后再纠正（见 reflow）
+      const w = window.innerWidth || document.documentElement.clientWidth || 0;
+      const h = window.innerHeight || document.documentElement.clientHeight || 0;
+      return { w: w || 1200, h: h || 800, known: w > 0 && h > 0 };
+    }
+    function clampToViewport(p) {
+      const { w, h } = viewport();
+      return { x: Math.max(4, Math.min(Math.round(p.x), w - 28)), y: Math.max(4, Math.min(Math.round(p.y), h - 32)) };
+    }
+    // 落脚点：视口已知 → 右下角内缩（看得见、又基本不压内容）；
+    //         视口未知 → 左上角内缩（任何尺寸的窗口里都最不可能落到视口外）
+    function parkSpot() {
+      const { w, h, known } = viewport();
+      return known ? { x: w - 70, y: h - 70 } : { x: 140, y: 140 };
+    }
+    // 视口从"不可测量"变成可测量（首次渲染 / 切回前台 / 缩放）后纠正一次位置
+    function reflow() {
+      if (!viewport().known) return false;
+      const p = clampToViewport(api._p);
+      if (p.x !== api._p.x || p.y !== api._p.y) api.move(p.x, p.y, 0);
+      return true;
+    }
+
     // ---------- API ----------
     const api = {
       _p: { x: -300, y: -300 },
@@ -209,6 +247,7 @@
         cur.style.transitionDuration = dur + 'ms';
         cur.style.transform = 'translate3d(' + x + 'px,' + y + 'px,0)';
         api._p = { x: Math.round(x), y: Math.round(y) };
+        savePos(api._p);
         return api._p;
       },
 
@@ -371,6 +410,20 @@
     };
 
     window.__dshCursor = api;
+
+    // 装好就立刻落到「该在的位置」：优先恢复上次的位置（同源导航），否则停在角落——
+    // 绝不留在屏幕外，那正是用户说的「鼠标消失了」
+    const start = clampToViewport(loadPos() || parkSpot());
+    api.move(start.x, start.y, 0);
+
+    // 视口尺寸变化（缩放 / 最大化 / 首次渲染）后把光标拉回视口内
+    window.addEventListener('resize', reflow);
+    document.addEventListener('visibilitychange', reflow);
+    let guard = 0;
+    const guardTimer = setInterval(() => {
+      if (reflow() || ++guard > 20) clearInterval(guardTimer);   // 最多盯 6 秒
+    }, 300);
+
     return 'installed';
   }
 

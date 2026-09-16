@@ -287,9 +287,11 @@ __dshCursor.clickTo('#submit')   // 光标滑过去 + 点击波纹（填表单�
 | `prevented` | 页面 `preventDefault()`——工具层 `hitVerified` **仍是 true** | 红 ✕ + 原因 |
 | `stopped` | 冒泡被 `stopPropagation()` | 红 ✕ + 原因 |
 
-为什么源码由脚本下发：把这 18KB 图层源码交给 Agent 每次粘进 `browser_evaluate`，一次要烧掉上万 token；`enable-cursor.mjs` 自己从磁盘读、经桥的 HTTP 面（`POST /api/command`）注册，Agent 只跑一条命令。
+为什么源码由脚本下发：把这约 20KB 图层源码交给 Agent 每次粘进 `browser_evaluate`，一次要烧掉上万 token；`enable-cursor.mjs` 自己从磁盘读、经桥的 HTTP 面（`POST /api/command`）注册，Agent 只跑一条命令。
 
 注入分两步，缺一不可：`Page.addScriptToEvaluateOnNewDocument` 注册到该标签页（之后新页面自动带上，且 DevTools 注入不受页面 CSP 限制）+ `Runtime.evaluate` 让**当前**文档立刻生效，不用刷新。
+
+**它不会"消失"**：光标位置记在 `sessionStorage`（同源导航后原样回到原处，实测 (400,300) 原样恢复）；跨源或首次注入时停在角落（视口还测不出来时用左上角兜底，测出来后再纠正）；窗口缩放 / 最大化后会被拉回视口内。所以换页面之后你依然看得见鼠标在哪。`--all` 可以一次注入所有标签页。
 
 实测踩到的两个坑（都已修）：告警层自己必须 `pointer-events:none`，否则红虚线框会变成新的遮挡物，工具预检立刻 `hitVerified:false`；自动判定的超时不能短于 Agent 的 `evaluate`→`browser_click` 往返（实测 >1.5s），且迟到的点击要能推翻超时结论。
 
