@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>DSH 模拟鼠标 · 点击判定测试台</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;font:15px/1.6 -apple-system,system-ui,"Segoe UI",sans-serif;
+       background:#0b1020;color:#e7ecf5;padding:30px 38px}
+  h1{font-size:21px;margin:0 0 6px}
+  .sub{color:#8b98ad;font-size:13px;margin-bottom:24px}
+  .grid{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:26px}
+  .slot{position:relative;display:flex;flex-direction:column;gap:8px}
+  .cap{font-size:12px;color:#7f8da6;letter-spacing:.02em}
+  button,a.btn{font:600 15px/1 inherit;color:#fff;background:#2b3a5c;border:1px solid #3d5177;
+       padding:16px 24px;border-radius:12px;cursor:pointer;transition:.15s;text-decoration:none;
+       display:inline-flex;align-items:center;justify-content:center;min-width:210px}
+  button:hover,a.btn:hover{background:#3a4d78}
+  #cover{position:absolute;left:0;right:0;top:22px;height:56px;border-radius:14px;
+       background:rgba(120,150,200,.22);border:1px solid rgba(150,180,230,.55);
+       display:grid;place-items:center;font-size:12px;color:#cfe0ff}
+  .panel{background:#111a2e;border:1px solid #23304d;border-radius:12px;padding:14px 18px;max-width:900px}
+  .panel h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#7f8da6;margin:0 0 10px}
+  #log{font:12.5px/1.85 ui-monospace,Consolas,monospace;color:#b9c6da;margin:0;padding:0;list-style:none}
+  #log li{border-bottom:1px dashed #1e2a44;padding:2px 0}
+  #log li:last-child{border-bottom:0}
+  .k{color:#ff8199}
+  .v{color:#7ee0a8}
+</style>
+</head>
+<body>
+  <h1>DSH 模拟鼠标 · 点击判定测试台</h1>
+  <div class="sub">四种点击结果：真的命中 / 被遮罩压住 / 被 preventDefault 拦下 / 被 stopPropagation 吃掉。判定层应当分别给出绿、红、红、红。</div>
+
+  <div class="grid">
+    <div class="slot">
+      <span class="cap">① 正常命中</span>
+      <button id="btn-ok">按钮 · 应该变绿</button>
+    </div>
+    <div class="slot">
+      <span class="cap">② 被遮罩压住</span>
+      <button id="btn-blocked">按钮 · 上面有遮罩</button>
+      <div id="cover">广告遮罩层（会吃掉点击）</div>
+    </div>
+    <div class="slot">
+      <span class="cap">③ preventDefault 拦截</span>
+      <a class="btn" id="link-prevented" href="https://example.com">链接 · 被 preventDefault</a>
+    </div>
+    <div class="slot">
+      <span class="cap">④ stopPropagation 吃掉</span>
+      <button id="btn-stopped">按钮 · 被 stopPropagation</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>实时事件流</h2>
+    <ul id="log"><li class="sub">等待事件…（还没有任何点击）</li></ul>
+  </div>
+
+<script src="../scripts/cursor-overlay.js"></script>
+<script>
+  const log = document.getElementById('log');
+  let n = 0;
+  function push(kind, e, extra){
+    if (n === 0) log.innerHTML = '';
+    const t = e.target;
+    const name = t.id ? '#' + t.id : (t.tagName.toLowerCase() + (String(t.className||'').split(' ')[0] ? '.' + String(t.className).split(' ')[0] : ''));
+    const li = document.createElement('li');
+    li.innerHTML = '<span class="k">' + String(++n).padStart(2,'0') + ' ' + kind + '</span> ' +
+      'on=<span class="v">' + name + '</span> ' +
+      'client=(<span class="v">' + Math.round(e.clientX) + ',' + Math.round(e.clientY) + '</span>)' +
+      (extra ? ' ' + extra : '');
+    log.appendChild(li);
+  }
+  document.addEventListener('mousedown', e => push('mousedown', e), true);
+  document.addEventListener('click', e => push('click-capture', e), true);
+  window.addEventListener('click', e => push('click-bubble ', e), false);
+
+  // ③ 拦下默认行为：看起来点了，其实什么都没发生
+  document.getElementById('link-prevented').addEventListener('click', e => {
+    e.preventDefault();
+    push('prevented  ', e, '<span class="k">defaultPrevented=true</span>');
+  });
+  // ④ 只吃掉冒泡：事件到不了外层
+  document.getElementById('btn-stopped').addEventListener('click', e => {
+    e.stopPropagation();
+    push('stopped    ', e, '<span class="k">stopPropagation</span>');
+  });
+
+  window.__events = [];
+  document.addEventListener('click', e => window.__events.push({
+    id: e.target.id || e.target.tagName, x: Math.round(e.clientX), y: Math.round(e.clientY), trusted: e.isTrusted
+  }), true);
+</script>
+</body>
+</html>
