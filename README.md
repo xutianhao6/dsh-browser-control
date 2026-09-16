@@ -37,6 +37,7 @@ fork 自 [caob23/dsh-browser-control](https://github.com/caob23/dsh-browser-cont
 | **「浏览器操作」模式** | 一个 DSH Agent preset：选中它，模型就知道该用 `browser_*` 工具去驱动浏览器，并遵守固定的操作顺序。详见[「浏览器操作」模式](#浏览器操作模式agent-preset)。 |
 | **修 `Runtime.evaluate` 隐形 100 ms 超时** | 调用方没传 `timeoutMs` 时，`Math.max(100, Number(x) \|\| 0)` 会把预算算成 **100 ms**，于是任何超过 0.1 秒的求值（页面内 fetch、多步读取、`await`）都报 `eval timeout after 100ms`，与「不传就走桥接 60 s 默认」的注释相反。现在不传即不设竞速计时器。 |
 | **修调试器掉线后不自愈** | `chrome.debugger.onDetach` 原本是空处理器：调试器被 DevTools / 其它扩展抢走或目标崩溃后，扩展内存里的 `attachedTabs` 仍以为自己挂着，之后该标签页每条命令都报 `Debugger is not attached to the tab with id: N`。现在 detach 即清除记录，`withCDP` 对该错误再重挂一次并重试。 |
+| **看得见的鼠标 + 点击命中判定** | CDP 点击不移动系统指针，窗口里没有鼠标，也看不出一次点击有没有生效。`scripts/cursor-overlay.js` 往页面注入一个 DOM 光标图层（`pointer-events:none`，绝不拦截事件），点前滑到目标上、点后自动判定；`scripts/enable-cursor.mjs` 经桥的 HTTP 面注入，Agent 只需一条命令、不必把图层源码贴进上下文。判定分 `ok / covered / no-event / prevented / stopped`，其中 `prevented`（页面 `preventDefault`）与 `stopped`（`stopPropagation`）**工具层的 `hitVerified` 依然是 true，抓不到**。详见[看得见的鼠标](#看得见的鼠标--点击命中判定)。 |
 
 ## 这是什么
 
@@ -108,6 +109,8 @@ powershell -ExecutionPolicy Bypass -File dsh-browser-control\scripts\verify-inst
 | `start-browser.ps1` / `start-browser.cmd` | 手动启动专属浏览器（双击 `.cmd` 即可） |
 | `bootstrap-extension.ps1` | 救急：用 CDP 把扩展临时装进 profile（会话级，关掉浏览器就没了） |
 | `reload-extension.ps1` | 改过 `extension/` 代码后清 Service Worker 脚本缓存 |
+| `enable-cursor.mjs` | 把可见光标 + 点击命中判定注入标签页（`--check` 看状态、`--off` 卸掉） |
+| `cursor-overlay.js` | 图层源码本体，由 `enable-cursor.mjs` 从磁盘读取后下发，别手动贴 |
 
 > 下面两节是**手动安装**的分步说明 —— 一键安装失败、或你想自己控制每一步时看。
 
@@ -256,6 +259,40 @@ browser-bridge:
 4. `launch.enabled: true` 时浏览器没开，插件会自己拉起专属环境（见上一节），不需要你先手动开；用 `-DisableLaunch` 装的 profile 不会自动拉起，先跑一次 `scripts\start-browser.ps1` 即可
 
 访问 `http://127.0.0.1:9777/` 查看连接状态。
+
+## 看得见的鼠标 + 点击命中判定
+
+`browser_click` 走 CDP `Input.dispatchMouseEvent`，**不会移动系统指针**——窗口里本来就没有鼠标，用户看不到 Agent 点了哪里，也看不出这一步有没有生效。`scripts/cursor-overlay.js` 往页面里注入一个 DOM 光标图层（`pointer-events:none`，绝不拦截事件）：点之前先滑到目标上，点完自动判定并上色。
+
+```powershell
+node scripts\enable-cursor.mjs                      # 注入当前活动标签页（一次即可，之后该标签页新页面自动带上）
+node scripts\enable-cursor.mjs --tab 12345 --check  # 看状态
+node scripts\enable-cursor.mjs --off                # 卸掉
+```
+
+Agent 侧是三步（「浏览器操作」模式的人设已经把这段写死，不用你提醒）：
+
+```js
+await __dshCursor.clickTo('#submit')   // 光标滑过去 + 点击波纹（填表单用 moveTo）
+// browser_click ...
+// → 自动判定：绿「命中」；红「被遮挡 / 被拦截 / 事件未到达」
+```
+
+| status | 含义 | 画面 |
+|---|---|---|
+| `ok` | 命中 | 绿环 + 「命中」 |
+| `covered` | 坐标上压着别的元素（工具预检也会 `hitVerified:false`） | 红 ✕ + 红虚线框圈出**真正吃到点击的元素** |
+| `no-event` | 点击坐标处没有任何 click 事件到达页面 | 红 ✕ + 原因 |
+| `prevented` | 页面 `preventDefault()`——工具层 `hitVerified` **仍是 true** | 红 ✕ + 原因 |
+| `stopped` | 冒泡被 `stopPropagation()` | 红 ✕ + 原因 |
+
+为什么源码由脚本下发：把这 18KB 图层源码交给 Agent 每次粘进 `browser_evaluate`，一次要烧掉上万 token；`enable-cursor.mjs` 自己从磁盘读、经桥的 HTTP 面（`POST /api/command`）注册，Agent 只跑一条命令。
+
+注入分两步，缺一不可：`Page.addScriptToEvaluateOnNewDocument` 注册到该标签页（之后新页面自动带上，且 DevTools 注入不受页面 CSP 限制）+ `Runtime.evaluate` 让**当前**文档立刻生效，不用刷新。
+
+实测踩到的两个坑（都已修）：告警层自己必须 `pointer-events:none`，否则红虚线框会变成新的遮挡物，工具预检立刻 `hitVerified:false`；自动判定的超时不能短于 Agent 的 `evaluate`→`browser_click` 往返（实测 >1.5s），且迟到的点击要能推翻超时结论。
+
+`demo/cursor-test.html` 是四种场景的测试台，双击打开即可（页面自己用相对路径加载图层）。
 
 ## 「浏览器操作」模式（Agent preset）
 

@@ -37,6 +37,7 @@ Forked from [caob23/dsh-browser-control](https://github.com/caob23/dsh-browser-c
 | **"Browser operations" mode** | A DSH agent preset: selecting it tells the model to drive the browser with the `browser_*` tools and follow a fixed workflow. See [Browser operations mode](#browser-operations-mode-agent-preset). |
 | **Fixed the hidden 100 ms `Runtime.evaluate` timeout** | With no caller-supplied `timeoutMs`, `Math.max(100, Number(x) \|\| 0)` collapsed the budget to **100 ms**, so any evaluation slower than a tenth of a second (in-page fetch, multi-step read, `await`) failed with `eval timeout after 100ms` — the opposite of the documented 60 s bridge default. |
 | **Fixed stale debugger state after a detach** | `chrome.debugger.onDetach` was a no-op, so after DevTools or another extension took the tab (or the target crashed), the in-memory `attachedTabs` still claimed the tab and every later command failed with `Debugger is not attached to the tab with id: N`. Detach now drops the record, and `withCDP` re-attaches once and retries. |
+| **A visible mouse cursor + click verdicts** | CDP clicks never move the OS pointer, so the window shows no cursor and no sign of whether a click took effect. `scripts/cursor-overlay.js` injects a DOM cursor layer (`pointer-events:none`, it never swallows an event): it slides onto the target before the click and paints the outcome afterwards. `scripts/enable-cursor.mjs` injects it through the bridge's HTTP face, so the agent runs one command instead of pasting the source into its context. Verdicts are `ok / covered / no-event / prevented / stopped` — and `prevented` (page called `preventDefault`) plus `stopped` (`stopPropagation`) still report `hitVerified: true` at the tool layer, which is exactly what the tool cannot see. See [A visible mouse cursor](#a-visible-mouse-cursor--click-verdicts). |
 
 ## What is this
 
@@ -108,6 +109,8 @@ The check drives real commands through the bridge: bridge listening / extension 
 | `start-browser.ps1` / `start-browser.cmd` | Start the dedicated browser by hand (double-click the `.cmd`) |
 | `bootstrap-extension.ps1` | Rescue: load the extension over CDP (session-scoped, gone with the browser) |
 | `reload-extension.ps1` | Clear the service-worker script cache after editing `extension/` |
+| `enable-cursor.mjs` | Inject the visible cursor + click verdicts into a tab (`--check` to inspect, `--off` to remove) |
+| `cursor-overlay.js` | The overlay source itself; `enable-cursor.mjs` reads it from disk — do not paste it by hand |
 
 > The next two sections are the **manual** install path — use them when the one-command install fails or you want to control each step.
 
@@ -257,6 +260,40 @@ There is exactly one way to tell: with `launch.enabled: true` and no extension c
 4. With `launch.enabled: true` the plugin starts the dedicated environment itself when nothing is connected (see above), so you never open it by hand; a profile installed with `-DisableLaunch` never auto-launches — run `scripts\start-browser.ps1` once instead
 
 Visit `http://127.0.0.1:9777/` for connection status.
+
+## A visible mouse cursor + click verdicts
+
+`browser_click` dispatches CDP `Input.dispatchMouseEvent`, which **never moves the OS pointer** — there is no cursor in the window, so the user cannot see where the agent clicked, nor whether the click took effect. `scripts/cursor-overlay.js` injects a DOM cursor layer into the page (`pointer-events:none`, it never swallows an event): it slides onto the target before the click, then paints the verdict.
+
+```powershell
+node scripts\enable-cursor.mjs                      # inject into the active tab (once; later pages in that tab inherit it)
+node scripts\enable-cursor.mjs --tab 12345 --check  # inspect only
+node scripts\enable-cursor.mjs --off                # remove
+```
+
+On the agent side it is three steps (the "Browser operations" persona hard-codes them, so you never have to ask):
+
+```js
+await __dshCursor.clickTo('#submit')   // slide the cursor there + click ripple (use moveTo before typing)
+// browser_click ...
+// → verdict appears automatically: green "hit"; red "covered / intercepted / no event"
+```
+
+| status | Meaning | On screen |
+|---|---|---|
+| `ok` | Hit | green ring + "命中" |
+| `covered` | Something else sits on the coordinates (the tool's own pre-check reports `hitVerified:false` too) | red ✕ + a red dashed box around the element that **actually swallowed the click** |
+| `no-event` | No click event reached the page at those coordinates | red ✕ + reason |
+| `prevented` | A page handler called `preventDefault()` — the tool layer still says `hitVerified: true` | red ✕ + reason |
+| `stopped` | Propagation was cut by `stopPropagation()` | red ✕ + reason |
+
+Why the script delivers the source: handing this 18 KB overlay to the agent to paste into `browser_evaluate` burns tens of thousands of tokens per injection; `enable-cursor.mjs` reads it from disk and registers it through the bridge's HTTP face (`POST /api/command`), so the agent runs one command.
+
+Injection is two steps, and both matter: `Page.addScriptToEvaluateOnNewDocument` registers it on that tab (later pages inherit it, and DevTools injection is not subject to page CSP) plus `Runtime.evaluate` to make the **current** document work immediately, with no reload.
+
+Two bugs found the hard way, both fixed: the warning layer itself must be `pointer-events:none`, otherwise the red dashed box becomes a new obstruction and the tool's pre-check immediately reports `hitVerified:false`; and the auto-verdict timeout must not be shorter than the agent's `evaluate`→`browser_click` round trip (measured >1.5 s), with late clicks able to overturn the timeout's conclusion.
+
+`demo/cursor-test.html` is a test bench with all four scenarios — just open it (the page loads the overlay itself via a relative path).
 
 ## "Browser operations" mode (agent preset)
 
