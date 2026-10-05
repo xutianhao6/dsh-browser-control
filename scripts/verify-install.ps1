@@ -229,17 +229,36 @@ if (-not $SkipAdvanced) {
 # ── 4. 安装物检查 ──────────────────────────────────────────────────────────
 Write-Host "`n[4] 安装物" -ForegroundColor Cyan
 
-Check "「浏览器操作」模式存在" {
-  $dir = Join-Path $DshHome '.agent-presets\browser'
-  $p = Join-Path $dir 'agent.cordis.yml'
-  if (-not (Test-Path $p)) { throw "缺 $p —— 跑一次 install.ps1（不加 -SkipPreset）" }
-  $name = '(无 preset.yml)'
-  $meta = Join-Path $dir 'preset.yml'
-  if (Test-Path $meta) {
-    foreach ($line in Get-Content $meta) { if ($line -match '^name:\s*(.+)$') { $name = $Matches[1].Trim(); break } }
+Check "「浏览器操作」preset bundle 已安装并登记" {
+  # 0.2.x 起 preset 是 bundle patch 里的一条 @deepseek-ai/dsh-agent-preset 声明行，
+  # 不再是「被扫描的目录」。只查文件存在会假 PASS（旧版检查就是这么骗过自己的：
+  # 目录写得好好的，模式列表里却什么都没有）。这里查 Loader 真正需要的三件事：
+  # bundle 文件、profile 的 dependencies + dsh.profile.bundles 登记、node_modules 链接。
+  $bundleName = '@local/dsh-browser-preset'
+  $patch = Join-Path $DshHome 'preset-bundles\browser\cordis.patch.yml'
+  if (-not (Test-Path $patch)) {
+    if (Test-Path (Join-Path $DshHome '.agent-presets\browser\agent.cordis.yml')) {
+      throw "只有 0.1.x 的旧布局 $DshHome\.agent-presets\browser —— 0.2.x 不读该目录，模式列表里不会出现它。跑一次 install.ps1（不加 -SkipPreset）"
+    }
+    throw "缺 $patch —— 跑一次 install.ps1（不加 -SkipPreset）"
   }
-  $rows = @(Get-Content $p | Where-Object { $_ -match '^- id:\s*\S' }).Count
-  "显示名：$name，组装行数：$rows"
+  $rows = @(Select-String -Path $patch -Pattern '^ {10}- id: ').Count
+  $display = '(未命名)'
+  foreach ($line in Get-Content $patch) { if ($line -match '^\s{8}name:\s*(\S.*)$') { $display = $Matches[1].Trim(); break } }
+
+  $owner = $null
+  foreach ($prof in (Get-ChildItem (Join-Path $DshHome 'profiles') -Directory -ErrorAction SilentlyContinue)) {
+    $pkg = Join-Path $prof.FullName 'package.json'
+    if ((Test-Path $pkg) -and ((Get-Content $pkg -Raw) -match [regex]::Escape($bundleName))) { $owner = $prof; break }
+  }
+  if (-not $owner) { throw "没有任何 profile 登记 $bundleName —— 跑一次 install.ps1" }
+  $pkgJson = Get-Content (Join-Path $owner.FullName 'package.json') -Raw | ConvertFrom-Json
+  if (@($pkgJson.dsh.profile.bundles) -notcontains $bundleName) {
+    throw "profile $($owner.Name) 只登记了依赖，没进 dsh.profile.bundles —— Loader 不会挂载它，重跑 install.ps1"
+  }
+  $link = Join-Path $owner.FullName "node_modules\@local\dsh-browser-preset"
+  if (-not (Test-Path $link)) { throw "缺链接 $link —— 重跑 install.ps1" }
+  "profile $($owner.Name)：显示名「$display」，组装行数 $rows，bundle + 登记 + 链接齐备"
 }
 
 Check "launch 配置已写进 profile 补丁层" {

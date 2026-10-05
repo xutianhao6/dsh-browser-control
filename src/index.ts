@@ -1,14 +1,18 @@
 /**
  * Browser-bridge plugin: one local WebSocket endpoint the DSH Browser Control
- * extension connects to, plus the model-facing `browser_*` tools that drive
- * it. The Settings-managed `enabled` flag starts and stops the listener live
- * through dsh-settings' change hook — no reload needed.
+ * extension connects to, plus the model-facing `browser_*` tools that drive it.
  *
- * We deliberately bypass the higher-level `installSettingsSection` helper and
- * talk to the lower-level `sctx.settings.register` API directly: that API
- * predates the helper and is the one stable across every dsh-settings build a
- * consumer is realistically pinned to. Importing the helper on a build that
- * does not export it crashes the whole plugin at module load.
+ * The `enabled` flag starts and stops the listener with no reload, across two
+ * generations of dsh:
+ *
+ * - **0.2.x** — `ctx.settings` is the `SettingsForms` service (the schema-derived
+ *   configuration UI). It exposes no per-plugin registry: the Loader re-applies
+ *   this plugin whenever its entry config changes, so converging the listener on
+ *   the `apply` argument *is* the live path, and the settings page is generated
+ *   from the `Config` schema below.
+ * - **0.1.x** — `ctx.settings.register` owned a per-plugin section and returned a
+ *   watchable scope. Still used when present (feature-detected at runtime),
+ *   because this same build is linked into 0.1.x profiles.
  *
  * Tools stay mounted whenever the plugin does; calling one while the bridge
  * is disabled or the extension is offline fails with a message naming the
@@ -21,12 +25,23 @@ import path from 'node:path'
 import { FiberState, type Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { JsonValue } from '@deepseek-ai/dsh-tools'
-import type { SettingsScope } from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-invariants'
+// Side-effect type import: dsh-settings is what augments `Context` with
+// `settings` (the 0.2.x SettingsForms service, or 0.1.x's section registry that
+// `apply` feature-detects). Without it the augmentation never loads.
+import type {} from '@deepseek-ai/dsh-settings'
 import { BridgeServer, cleanupArtifacts } from './server.ts'
 import { BrowserLauncher, type ResolvedLaunchConfig } from './launch.ts'
 import { registerReverseTools } from './reverse.ts'
+
+/**
+ * A JSON value, as the runtime defines it: `dsh-util-values`' `JsonValue`, which
+ * dsh-tools re-exported through 0.1.x and stopped re-exporting in 0.2.0. Declared
+ * here rather than imported so one build serves both generations — the plugin's
+ * own value types are structural, and a type-only import of the implementation
+ * package would add a dependency the plugin otherwise does not have.
+ */
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'browser-bridge'
@@ -83,6 +98,12 @@ export interface LaunchConfig {
 	bootstrapScript?: string
 }
 
+// Annotated, with one narrowing cast. An object schema's fields stay polymorphic
+// over schemastery's `Mode`: since 3.18 a `.default()` field is typed
+// `T | Volatile<T>` (it may carry a volatile config reference), so the inferred
+// type is not assignable to this concrete one — while the annotation itself is
+// required, because declaration emit cannot name the package-internal `Schema`
+// type. `resolveConfig` is what turns the entry's raw values into a plain `Config`.
 export const Config: z<Config> = z.object({
 	enabled: z.boolean().default(true),
 	port: z.number().step(1).min(1024).max(65_535).default(9777),
@@ -97,7 +118,7 @@ export const Config: z<Config> = z.object({
 		waitMs: z.number().step(1).min(1_000).max(120_000).default(25_000),
 		bootstrapScript: z.string().default(''),
 	}),
-})
+}) as z<Config>
 
 interface ResolvedConfig {
 	enabled: boolean
@@ -997,7 +1018,27 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 	registerReverseTools(ctx, controller)
 }
 
-/** Cordis plugin entry: wire the settings-driven lifecycle plus the model-facing tools. */
+/**
+ * dsh-settings 0.1.x's per-plugin section registry. 0.2.0 replaced it with the
+ * `SettingsForms` service (describe/update/mutate over profile-patch entries) and
+ * applies an edit by re-applying the plugin, so this shape is only exercised when
+ * a 0.1.x build loaded us.
+ */
+interface LegacySettingsRegistry {
+	register(
+		ns: string,
+		schema: unknown,
+		options: { base: Config; validate?: (value: Config) => void },
+	): LegacySettingsScope
+}
+
+/** The watchable section handle a 0.1.x `register` call returns. */
+interface LegacySettingsScope {
+	get(): Config
+	watch(listener: () => void): unknown
+}
+
+/** Cordis plugin entry: wire the listener lifecycle plus the model-facing tools. */
 export function apply(ctx: Context, config: Config): void {
 	const resolved = resolveConfig(config)
 	if (resolved.enabled && resolved.token.trim().length === 0) {
@@ -1006,27 +1047,21 @@ export function apply(ctx: Context, config: Config): void {
 	const controller = new BridgeController(line => ctx.logger.info(line))
 
 	let current: () => ResolvedConfig = () => resolved
-	// Equivalent of @deepseek-ai/dsh-settings' `installSettingsSection`, inlined so
-	// the plugin still loads on dsh-settings builds that predate the helper. The
-	// underlying `sctx.settings.register` API is the one stable across every
-	// dsh-settings version a consumer is realistically pinned to.
 	ctx.inject(['settings'], (sctx) => {
-		const scope = (sctx.settings.register as (
-			ns: string,
-			schema: typeof Config,
-			options: { base: Config; validate?: (value: Config) => void },
-		) => SettingsScope<Config>)(
-			BROWSER_BRIDGE_SETTINGS_NAMESPACE,
-			Config,
-			{
-				base: config,
-				validate: (value) => {
-					if (value.enabled && (value.token ?? '').trim().length === 0) {
-						throw new Error('browser-bridge: token must be a non-empty string when enabled')
-					}
-				},
+		// 0.2.x: `ctx.settings` is the SettingsForms service and carries no
+		// per-plugin registry — there is nothing to subscribe to, because the
+		// Loader re-applies this plugin with the new config on an entry edit.
+		// Only a 0.1.x build still has the watchable `register` API.
+		const register = (sctx.settings as unknown as Partial<LegacySettingsRegistry>).register
+		if (typeof register !== 'function') return
+		const scope = register.call(sctx.settings, BROWSER_BRIDGE_SETTINGS_NAMESPACE, Config, {
+			base: config,
+			validate: (value) => {
+				if (value.enabled && (value.token ?? '').trim().length === 0) {
+					throw new Error('browser-bridge: token must be a non-empty string when enabled')
+				}
 			},
-		)
+		})
 		current = () => resolveConfig(scope.get())
 		ctx.effect(() => () => {
 			// Mirror `isUnloading` from dsh-settings (private): the fiber's own

@@ -1,5 +1,19 @@
 # 更新日志
 
+## v1.0.10 (2026-10-05)
+
+适配 **dsh 0.2.x**（DSH NEXT `0.2.0-rc.2` / cordis 4.0.4 / schemastery 3.18.4），同时继续服务 0.1.x。这一版修的是「装上了，但一行都不挂载 / 模式列表里什么都没有」这两类静默失败。
+
+- 兼容：**peer 范围放宽到 `<0.3.0-0`**（`dsh-invariants` / `dsh-settings` / `dsh-tools`）。原范围是 `<0.2.0-0`，于是 0.2.x 的 plugin-manager 判定整个 bundle `incompatible-version`，**一行都不挂载**：桥不监听、9777 没进程、`browser_*` 工具一个都不出现，而日志里只有一句版本不兼容。放宽后 0.2.x 直接可用，不需要在设置里对某个版本授予「版本豁免」（豁免是官方为此留的逃生口，有崩溃风险，不该是常规安装路径）。
+- 适配：`JsonValue` 在 0.2.0 从 `@deepseek-ai/dsh-tools` 移到 `@deepseek-ai/dsh-util-values`，改为**本模块内的结构化声明** —— 一个构建同时服务两代，也免得为纯类型引用去依赖一个实现包。
+- 适配：`@deepseek-ai/dsh-settings` 的 `SettingsScope` / `sctx.settings.register` 已被 0.2.0 的 `SettingsForms`（`describe`/`update`/`mutate` + profile 补丁）取代，`installSettingsSection` 也已不存在。旧代码在 0.2.x 上会在注入回调里对 `undefined` 调 `register`（抛 `TypeError`，但挂载已经完成，所以只表现为「设置开关不生效」这种难查的现象）。现在**先探测再调用**：没有 `register` 就什么都不做 —— 0.2.x 走「Loader 因条目配置变更而重新 `apply` 本插件」这条路（**已实测**：只改 profile 补丁层，桥热停又热启，无需重启 dsh；`SettingsForms` 的 `applies: 'live'` 就是这个承诺），0.1.x 仍是原来的可 watch 作用域。两代的设置页都由 `Config` schema 自动生成。
+- 适配：schemastery 3.18 起对象 schema 对 `Mode` 保持多态（`.default()` 字段的类型是 `T | Volatile<T>`，因为它可能承载一个 volatile 配置引用），`z<Config>` 标注不再成立；而 3.18 的 `Schema` 不是具名导出，去掉标注又会因声明产物无法命名该类型而报 TS2883。最终写法是「保留标注 + 一次窄化转换」，运行时取值仍由 `resolveConfig` 归一为普通值（本插件的字段没有 `meta.volatile`，实测拿到的就是普通值）。
+- 修复：**`install.ps1` 生成的「浏览器操作」模式在 0.2.x 上根本不会出现**。0.2.x 已不再扫描 `$DSH_HOME/.agent-presets/<id>/`，preset 改为 bundle patch 里的一条 `@deepseek-ai/dsh-agent-preset` 声明行。脚本现在按目标运行时的世代自动选布局：新布局在 `$DSH_HOME/preset-bundles/browser` 生成 bundle —— 组装**逐字取自目标运行时随附的** `dsh-web-app/presets/standard.patch.yml`（不再从仓库里带一份，避免随运行时漂移），只把 `persona` 行的 `config` 换成人设 —— 并登记进 profile 的 `dependencies`（`link:`）+ `dsh.profile.bundles`，补好 `node_modules` 链接（不必等 dsh 启动时那次 pnpm 物化）。找不到新布局才回退 0.1.x 目录。新增 `-RuntimeDir` 可显式指定 dsh 安装目录。
+- 修复：`verify-install.ps1` 的「模式存在」检查只看那两个文件在不在，于是对着 0.1.x 的死目录报 **PASS** —— 自检全绿而模式列表里什么都没有。现在查 Loader 真正需要的三件事：bundle 文件、profile 登记（`dependencies` + `dsh.profile.bundles`）、`node_modules` 链接；发现只剩旧目录时明确报「0.2.x 不读它」。
+- 文档：`AGENTS.md` / `README.md` / `README.en.md` 的 preset 一节按两代布局重写；故障表新增「模式列表里没有『浏览器操作』」与「插件装了但 `browser_*` 全不出现」两条（两者的现象都很安静，值得单独列）。
+- 版本：`extension/manifest.json` 与 `package.json` 均为 **1.0.10**。扩展代码本身未改；升级后需要在扩展页点一次「刷新」（或跑 `scripts/reload-extension.ps1`），否则自检的「扩展版本 = 仓库版本」会红。
+- 兼容性验证：0.2.0-rc.2 上 `pnpm run typecheck` + `pnpm run build` 通过；本机 `verify-install.ps1` 全绿（含 token 门 / 逆向能力 / 新的 preset 检查）、`verify-reverse.mjs` 26/26、`browser_*` 工具实跑五步全过。
+
 ## v1.0.9 (2026-09-14)
 
 面向**接口分析 / JS 逆向**的完整能力集：抓包 → 看真实请求头 → 取响应体 / 导 HAR → 定位脚本 → 还原 sourcemap → 函数级 hook 抓入参 → 改包重放 / 伪造响应。全部复用扩展已有的 CDP 附着，不引入代理、证书或新的运行依赖。

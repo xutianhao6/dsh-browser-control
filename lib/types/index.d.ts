@@ -1,14 +1,18 @@
 /**
  * Browser-bridge plugin: one local WebSocket endpoint the DSH Browser Control
- * extension connects to, plus the model-facing `browser_*` tools that drive
- * it. The Settings-managed `enabled` flag starts and stops the listener live
- * through dsh-settings' change hook — no reload needed.
+ * extension connects to, plus the model-facing `browser_*` tools that drive it.
  *
- * We deliberately bypass the higher-level `installSettingsSection` helper and
- * talk to the lower-level `sctx.settings.register` API directly: that API
- * predates the helper and is the one stable across every dsh-settings build a
- * consumer is realistically pinned to. Importing the helper on a build that
- * does not export it crashes the whole plugin at module load.
+ * The `enabled` flag starts and stops the listener with no reload, across two
+ * generations of dsh:
+ *
+ * - **0.2.x** — `ctx.settings` is the `SettingsForms` service (the schema-derived
+ *   configuration UI). It exposes no per-plugin registry: the Loader re-applies
+ *   this plugin whenever its entry config changes, so converging the listener on
+ *   the `apply` argument *is* the live path, and the settings page is generated
+ *   from the `Config` schema below.
+ * - **0.1.x** — `ctx.settings.register` owned a per-plugin section and returned a
+ *   watchable scope. Still used when present (feature-detected at runtime),
+ *   because this same build is linked into 0.1.x profiles.
  *
  * Tools stay mounted whenever the plugin does; calling one while the bridge
  * is disabled or the extension is offline fails with a message naming the
@@ -17,6 +21,16 @@
  */
 import { type Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
+/**
+ * A JSON value, as the runtime defines it: `dsh-util-values`' `JsonValue`, which
+ * dsh-tools re-exported through 0.1.x and stopped re-exporting in 0.2.0. Declared
+ * here rather than imported so one build serves both generations — the plugin's
+ * own value types are structural, and a type-only import of the implementation
+ * package would add a dependency the plugin otherwise does not have.
+ */
+export type JsonValue = null | boolean | number | string | JsonValue[] | {
+    [key: string]: JsonValue;
+};
 /** Cordis plugin name used by loader diagnostics. */
 export declare const name = "browser-bridge";
 /** The tool registry this plugin contributes `browser_*` tools to. */
@@ -68,5 +82,5 @@ export interface LaunchConfig {
     bootstrapScript?: string;
 }
 export declare const Config: z<Config>;
-/** Cordis plugin entry: wire the settings-driven lifecycle plus the model-facing tools. */
+/** Cordis plugin entry: wire the listener lifecycle plus the model-facing tools. */
 export declare function apply(ctx: Context, config: Config): void;

@@ -2,16 +2,24 @@
   DSH Browser Control —— 一键安装器（幂等，可重复运行）
 
   做四件事：
-    1. 把本仓库的插件包装进 dsh 的 web profile（node_modules + profile package.json）
+    1. 把本仓库的插件包装进目标 dsh profile（node_modules + profile package.json）
     2. 在 profile 的用户层补丁里写 browser-bridge 配置（含 launch 专属浏览器环境）
-       —— 该层声明了 patchReload: live；但实测只改 launch.* 时运行中的 dsh 未必把它
-          重组进插件配置，改了没生效就重启一次 dsh
-    3. 生成「浏览器操作」Agent preset（复制 dsh 随附的 standard 组装 + 换成浏览器人设；
-       人设里那句「插件会自动把它拉起来」按 launch 配置生成，-DisableLaunch 时不会出现）
+       —— 0.2.x 实测：改这一层会热重组（桥热停又热启），不需要重启 dsh
+    3. 生成「浏览器操作」Agent preset —— 按目标运行时的世代自动选布局：
+         0.2.x：$DSH_HOME\preset-bundles\browser 里一个 bundle（一条
+                @deepseek-ai/dsh-agent-preset 声明行），登记进 profile 的
+                dependencies + dsh.profile.bundles + node_modules 链接。
+                0.2.x 已不再扫描 .agent-presets 目录。
+         0.1.x：$DSH_HOME\.agent-presets\browser\{preset.yml,agent.cordis.yml}
+       两代的组装都取自**目标运行时随附的** standard（plugins 段逐字复制），只把
+       persona 那段换成人设；人设里那句「插件会自动把它拉起来」按 launch 配置生成，
+       -DisableLaunch 时不会出现。
     4. 启动专属浏览器并打开 chrome://extensions，打印需要用户手动做的部署步骤
 
   用法：
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+    powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -ProfileName dsh-next
+    powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -RuntimeDir "D:\Program Files\DSH NEXT\resources\app"
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -ProfileDir D:\dsh-browser-profile
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -SkipPreset -SkipLaunch
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UseCli     # 改用 dsh plugin add 安装
@@ -29,6 +37,7 @@ param(
   [string]$ProfileDir,
   [string]$ChromePath,
   [string]$ExtensionDir,
+  [string]$RuntimeDir,
   [int]$Port = 9777,
   [string]$Token = 'dsh-local',
   [string[]]$LaunchUrls = @(),
@@ -254,25 +263,174 @@ Step "3/4 生成「浏览器操作」模式（Agent preset）"
 if ($SkipPreset) {
   Info "已按 -SkipPreset 跳过"
 } else {
-  $presetDir = Join-Path $DshHome '.agent-presets\browser'
-  $shipped = $null
-  $globs = @(
+  # 两代 preset 布局，按目标运行时装的是哪一代自动选择：
+  #   0.2.x —— preset 是 bundle patch 里的一条 @deepseek-ai/dsh-agent-preset 声明行，
+  #            组装取自运行时随附的 dsh-web-app\presets\standard.patch.yml；
+  #   0.1.x —— $DSH_HOME\.agent-presets\<id>\{preset.yml,agent.cordis.yml}。
+  # 两边的组装都**必须**取自目标运行时随附的文件：preset 决定一个 Agent 的整个工具面，
+  # 往仓库里抄一份就一定会随运行时漂移（旧版脚本正是这么坏掉的：0.2.x 已不再读
+  # .agent-presets 目录，生成得再对也不会出现在模式列表里）。
+  $appDirs = @()
+  if ($RuntimeDir) { $appDirs += $RuntimeDir }
+  foreach ($proc in @(Get-CimInstance Win32_Process -Filter "Name like 'DSH%'" -ErrorAction SilentlyContinue)) {
+    if ($proc.ExecutablePath) { $appDirs += (Split-Path $proc.ExecutablePath -Parent) }
+  }
+
+  $stdNew = $null
+  $newCands = @()
+  foreach ($d in $appDirs) {
+    $newCands += (Join-Path $d 'resources\app\node_modules\@deepseek-ai\dsh-web-app\presets\standard.patch.yml')
+    $newCands += (Join-Path $d 'node_modules\@deepseek-ai\dsh-web-app\presets\standard.patch.yml')
+  }
+  $newCands += (Join-Path $profilePath 'node_modules\@deepseek-ai\dsh-web-app\presets\standard.patch.yml')
+  $newCands += (Join-Path $DshHome 'profiles\node_modules\@deepseek-ai\dsh-web-app\presets\standard.patch.yml')
+  foreach ($c in $newCands) { if ($c -and (Test-Path $c)) { $stdNew = $c; break } }
+
+  $stdOld = $null
+  $oldCands = @(
     (Join-Path $profilePath 'node_modules\@deepseek-ai\dsh-agent-presets\presets\standard\agent.cordis.yml'),
     (Join-Path $DshHome 'profiles\node_modules\@deepseek-ai\dsh-agent-presets\presets\standard\agent.cordis.yml'),
     (Join-Path $env:LOCALAPPDATA 'npm-cache\_npx\*\node_modules\@deepseek-ai\dsh-agent-presets\presets\standard\agent.cordis.yml'),
     (Join-Path $env:APPDATA 'npm\node_modules\@deepseek-ai\dsh-agent-presets\presets\standard\agent.cordis.yml')
   )
-  foreach ($g in $globs) {
+  foreach ($g in $oldCands) {
     $hit = Get-ChildItem $g -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($hit) { $shipped = $hit.FullName; break }
+    if ($hit) { $stdOld = $hit.FullName; break }
   }
 
-  if (-not $shipped) {
-    Warn "找不到 dsh 随附的 standard preset 组装 —— 跳过模式生成"
-    Info "手动做法见 README「浏览器操作模式」一节"
+  # 人设里的兜底路径随仓库位置变；拉起那句话随 launch 配置变 —— 用 -DisableLaunch 装时
+  # 补丁层写的是 launch.enabled: false，插件根本不会拉起浏览器，人设就不能说它会自动拉起
+  # （否则模型会一直等一个不会发生的拉起，然后自己去翻应用包体找启动方式）。
+  $launchTail = @(
+    '        powershell -NoProfile -ExecutionPolicy Bypass -File "{{REPO_DIR}}\scripts\start-browser.ps1"'
+    '        拉起来后用 browser_tabs 确认。仍然连不上（扩展没装或被停用），才把「在专属窗口里 chrome://extensions → 开发者模式 → 加载已解压的扩展程序」这一步交还用户。桥的状态页 http://127.0.0.1:{{PORT}}/api/status（看 extensionConnected）能一眼判断扩展在不在线；故障排查见 "{{REPO_DIR}}\AGENTS.md" 的「常见故障」。'
+  ) -join "`n"
+  $launchHead = if ($DisableLaunch) {
+    '- 浏览器是一个专属环境（独立 profile，只装了 DSH Browser Control 扩展），与用户日常浏览器隔离。**这个 profile 装的时候带了 -DisableLaunch，插件不会自动拉起浏览器**（桥端口是单实例，同一台机器只让一个 profile 负责拉起）：工具报"没有扩展连接"就是浏览器没开，不要问用户，自己跑：'
   } else {
+    '- 浏览器是一个专属环境（独立 profile，只装了 DSH Browser Control 扩展），与用户日常浏览器隔离。工具报"没有扩展连接"时，插件会自动把它拉起来（那次调用最多等约 25 秒，所以比平时慢是正常的）；**连着两次都是同一条错**就说明自动拉起没生效（launch.enabled 被关掉、没热生效，或扩展没装/被停用），这时不要问用户，自己跑：'
+  }
+  $placeholders = @('{{LAUNCH_BULLET}}', '{{REPO_DIR}}', '{{PORT}}')
+
+  if (-not $stdNew -and -not $stdOld) {
+    Warn "找不到目标 dsh 随附的 standard preset 组装 —— 跳过模式生成"
+    Info "手动做法见 README「浏览器操作模式」一节"
+  } elseif ($stdNew) {
+    $bundleName = '@local/dsh-browser-preset'
+    $bundleDir = Join-Path $DshHome 'preset-bundles\browser'
+
+    # 组装：逐字搬随附 standard 的 plugins 段，只把 persona 那一行的 config 换成人设。
+    $std = [System.IO.File]::ReadAllLines($stdNew, [System.Text.Encoding]::UTF8)
+    $p = -1
+    for ($k = 0; $k -lt $std.Count; $k++) { if ($std[$k] -match '^\s+plugins:\s*$') { $p = $k; break } }
+    if ($p -lt 0) { throw "$stdNew 里找不到 plugins: 段 —— 运行时布局变了，install.ps1 需要更新" }
+    $plugins = @($std[$p..($std.Count - 1)])
+
+    $pi = -1
+    for ($k = 0; $k -lt $plugins.Count; $k++) { if ($plugins[$k] -match '^\s+- id: persona\s*$') { $pi = $k; break } }
+    if ($pi -lt 0) { throw "$stdNew 里找不到 persona 行" }
+    # 一条声明的内容 = 它后面所有缩进更深的行（bundle 里声明行固定 10 空格缩进）
+    $pj = $pi + 1
+    while ($pj -lt $plugins.Count -and ($plugins[$pj].Trim() -eq '' -or $plugins[$pj] -match '^\s{12,}\S')) { $pj++ }
+    $rowBody = @()
+    if ($pj -gt $pi + 1) { $rowBody = @($plugins[($pi + 1)..($pj - 1)]) }
+    $ci = -1
+    for ($k = 0; $k -lt $rowBody.Count; $k++) { if ($rowBody[$k] -match '^\s+config:\s*$') { $ci = $k; break } }
+    if ($ci -lt 0) { throw "$stdNew 的 persona 行里找不到 config:" }
+    $rowHead = @()
+    if ($ci -gt 0) { $rowHead = @($rowBody[0..($ci - 1)]) }
+    $rowTail = @()
+    if ($pj -le ($plugins.Count - 1)) { $rowTail = @($plugins[$pj..($plugins.Count - 1)]) }
+
+    # 人设：assets\persona.yml 的 config: 段整体 +10 空格（资产里是 0 级组装的 4 空格
+    # 子项，bundle 声明里对应 14 空格）
+    $asset = @(Get-Content (Join-Path $PSScriptRoot 'assets\persona.yml'))
+    $ai = -1
+    for ($k = 0; $k -lt $asset.Count; $k++) { if ($asset[$k] -match '^\s+config:\s*$') { $ai = $k; break } }
+    if ($ai -lt 0) { throw "assets\persona.yml 里找不到 config: 段" }
+    $ablock = @($asset[$ai..($asset.Count - 1)])
+    while ($ablock.Count -gt 0 -and $ablock[$ablock.Count - 1].Trim() -eq '') { $ablock = @($ablock[0..($ablock.Count - 2)]) }
+    $ablockText = ($ablock -join "`n").Replace('{{LAUNCH_BULLET}}', ($launchHead + "`n" + $launchTail)).Replace('{{REPO_DIR}}', $RepoDir).Replace('{{PORT}}', "$Port")
+    $leftover = $placeholders | Where-Object { $ablockText.Contains($_) }
+    if ($leftover) { Warn "人设里还有没替换掉的占位符（$($leftover -join '、')）—— 检查 assets\persona.yml" }
+    $newCfg = @($ablockText -split "`n" | ForEach-Object { if ($_.Trim() -eq '') { '' } else { (' ' * 10) + $_ } })
+
+    $decl = @(
+      '# 由 scripts/install.ps1 生成，重跑安装器会覆盖这里。'
+      '# dsh 0.2.x 起 preset 不再是被扫描的目录，而是 bundle patch 里的一条声明行；'
+      '# 下面的 plugins 段逐字取自目标运行时随附的 dsh-web-app\presets\standard.patch.yml。'
+      '- insert:'
+      '    - id: preset-browser'
+      "      name: '@deepseek-ai/dsh-agent-preset'"
+      '      config:'
+      '        id: browser'
+      '        name: 浏览器操作'
+      '        description: "驱动一个专属 Chrome 环境：读页面、点按钮、填表单、上传、截图，并可在页面里执行 JS。选它就是让 Agent 去操作浏览器。"'
+      '        order: 10'
+    )
+    $patchText = (@($decl) + @($plugins[0..$pi]) + $rowHead + $newCfg + $rowTail) -join "`n"
+    Write-Text (Join-Path $bundleDir 'cordis.patch.yml') ($patchText + "`n")
+    Write-Text (Join-Path $bundleDir 'package.json') (([pscustomobject]@{
+      name = $bundleName
+      version = '1.0.0'
+      private = $true
+      type = 'module'
+      dsh = [pscustomobject]@{ bundle = [pscustomobject]@{ patch = './cordis.patch.yml' } }
+    }) | ConvertTo-Json -Depth 6)
+
+    # profile 登记：dependencies（link:）+ dsh.profile.bundles，再补一个 junction ——
+    # 这样不依赖 dsh 启动时那次 pnpm 物化，当次就能被 Loader 解析到。
+    $depSpec = 'link:' + ($bundleDir -replace '\\', '/')
+    $profilePkgPath = Join-Path $profilePath 'package.json'
+    $profilePkg = Get-Content $profilePkgPath -Raw | ConvertFrom-Json
+    $changed = $false
+    if (-not $profilePkg.dependencies) {
+      $profilePkg | Add-Member -NotePropertyName dependencies -NotePropertyValue ([pscustomobject]@{}) -Force
+      $changed = $true
+    }
+    $depProp = $profilePkg.dependencies.PSObject.Properties[$bundleName]
+    if (-not $depProp -or $depProp.Value -ne $depSpec) {
+      $profilePkg.dependencies | Add-Member -NotePropertyName $bundleName -NotePropertyValue $depSpec -Force
+      $changed = $true
+    }
+    if (-not $profilePkg.dsh) { $profilePkg | Add-Member -NotePropertyName dsh -NotePropertyValue ([pscustomobject]@{}) -Force; $changed = $true }
+    if (-not $profilePkg.dsh.profile) { $profilePkg.dsh | Add-Member -NotePropertyName profile -NotePropertyValue ([pscustomobject]@{}) -Force; $changed = $true }
+    $bundles = @($profilePkg.dsh.profile.bundles)
+    if ($bundles -notcontains $bundleName) {
+      $bundles += $bundleName
+      $profilePkg.dsh.profile | Add-Member -NotePropertyName bundles -NotePropertyValue $bundles -Force
+      $changed = $true
+    }
+    if ($changed) { Write-Text $profilePkgPath ($profilePkg | ConvertTo-Json -Depth 10) }
+
+    $linkParent = Join-Path $profilePath 'node_modules\@local'
+    New-Item -ItemType Directory -Force -Path $linkParent | Out-Null
+    $linkPath = Join-Path $linkParent 'dsh-browser-preset'
+    $relink = $true
+    if (Test-Path $linkPath) {
+      $item = Get-Item $linkPath -Force
+      $target = @($item.Target) | Where-Object { $_ } | Select-Object -First 1
+      $resolved = if ($target) { (Resolve-Path $target -ErrorAction SilentlyContinue).Path } else { $null }
+      if ($resolved -and $resolved.TrimEnd('\') -ieq $bundleDir.TrimEnd('\')) {
+        $relink = $false
+      } elseif ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        [System.IO.Directory]::Delete($linkPath, $false)   # 只断链，不动目标
+      } else {
+        Remove-Item $linkPath -Recurse -Force
+      }
+    }
+    if ($relink) { New-Item -ItemType Junction -Path $linkPath -Target $bundleDir | Out-Null }
+
+    Ok "preset bundle 就位：$bundleDir"
+    Info "profile 已登记 $bundleName（dependencies + bundles），声明行 id = browser"
+    if (Test-Path (Join-Path $DshHome '.agent-presets\browser')) {
+      Warn "旧布局目录仍在，但 0.2.x 不读它 —— 清掉可避免误判："
+      Info "Remove-Item -Recurse -Force '$DshHome\.agent-presets\browser'"
+    }
+  } else {
+    $presetDir = Join-Path $DshHome '.agent-presets\browser'
     New-Item -ItemType Directory -Force -Path $presetDir | Out-Null
-    Copy-Item $shipped (Join-Path $presetDir 'agent.cordis.yml') -Force
+    Copy-Item $stdOld (Join-Path $presetDir 'agent.cordis.yml') -Force
     Copy-Item (Join-Path $PSScriptRoot 'assets\preset.yml') (Join-Path $presetDir 'preset.yml') -Force
 
     # 资产文件开头的说明性注释是给人看的，不要拼进组装
@@ -280,22 +438,8 @@ if ($SkipPreset) {
     $start = 0
     while ($start -lt $personaLines.Count -and ($personaLines[$start].Trim() -eq '' -or $personaLines[$start].TrimStart().StartsWith('#'))) { $start++ }
     $persona = ($personaLines[$start..($personaLines.Count - 1)] -join "`n").TrimEnd()
-
-    # 人设里的兜底路径随仓库位置变；拉起那句话随 launch 配置变 —— 用 -DisableLaunch 装时
-    # 补丁层写的是 launch.enabled: false，插件根本不会拉起浏览器，人设就不能说它会自动拉起
-    # （否则模型会一直等一个不会发生的拉起，然后自己去翻应用包体找启动方式）。
-    $launchTail = @(
-      '        powershell -NoProfile -ExecutionPolicy Bypass -File "{{REPO_DIR}}\scripts\start-browser.ps1"'
-      '        拉起来后用 browser_tabs 确认。仍然连不上（扩展没装或被停用），才把「在专属窗口里 chrome://extensions → 开发者模式 → 加载已解压的扩展程序」这一步交还用户。桥的状态页 http://127.0.0.1:{{PORT}}/api/status（看 extensionConnected）能一眼判断扩展在不在线；故障排查见 "{{REPO_DIR}}\AGENTS.md" 的「常见故障」。'
-    ) -join "`n"
-    $launchHead = if ($DisableLaunch) {
-      '- 浏览器是一个专属环境（独立 profile，只装了 DSH Browser Control 扩展），与用户日常浏览器隔离。**这个 profile 装的时候带了 -DisableLaunch，插件不会自动拉起浏览器**（桥端口是单实例，同一台机器只让一个 profile 负责拉起）：工具报"没有扩展连接"就是浏览器没开，不要问用户，自己跑：'
-    } else {
-      '- 浏览器是一个专属环境（独立 profile，只装了 DSH Browser Control 扩展），与用户日常浏览器隔离。工具报"没有扩展连接"时，插件会自动把它拉起来（那次调用最多等约 25 秒，所以比平时慢是正常的）；**连着两次都是同一条错**就说明自动拉起没生效（launch.enabled 被关掉、没热生效，或扩展没装/被停用），这时不要问用户，自己跑：'
-    }
     $persona = $persona.Replace('{{LAUNCH_BULLET}}', ($launchHead + "`n" + $launchTail)).Replace('{{REPO_DIR}}', $RepoDir).Replace('{{PORT}}', "$Port")
-    # 只查本脚本负责的三个占位符：{{model}} / {{cwd}} 是 dsh 自己的模板变量，必须原样留着
-    $leftover = @('{{LAUNCH_BULLET}}', '{{REPO_DIR}}', '{{PORT}}') | Where-Object { $persona.Contains($_) }
+    $leftover = $placeholders | Where-Object { $persona.Contains($_) }
     if ($leftover) { Warn "人设里还有没替换掉的占位符（$($leftover -join '、')）—— 检查 assets\persona.yml" }
 
     $composition = Get-Content (Join-Path $presetDir 'agent.cordis.yml') -Raw
@@ -303,7 +447,7 @@ if ($SkipPreset) {
     if ([regex]::IsMatch($composition, $pattern)) {
       $composition = [regex]::Replace($composition, $pattern, ($persona + "`n`n"), 1)
       Write-Text (Join-Path $presetDir 'agent.cordis.yml') $composition
-      Ok "已生成 $presetDir（standard 组装 + 浏览器人设）"
+      Ok "已生成 $presetDir（0.1.x 布局：standard 组装 + 浏览器人设）"
     } else {
       Warn "复制来的组装里找不到 persona 段落，模式已生成但用的是原人设"
     }

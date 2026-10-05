@@ -8,6 +8,7 @@
 |---|---|
 | 平台 | Windows（脚本是 PowerShell） |
 | dsh | 已安装，且 `%DSH_HOME%`（默认 `~/.dsh`）下已有 `profiles/web` |
+| dsh 版本 | **0.1.x 与 0.2.x 都支持**（v1.0.10 起 peer 范围放宽到 `<0.3.0-0`）。0.2.x 上 preset 是 bundle 声明行，0.1.x 上是 `.agent-presets` 目录，`install.ps1` 按目标运行时自动选 |
 | 浏览器 | Chrome 116+ |
 | Node / pnpm | **不需要**（`lib/` 构建产物随仓库提交） |
 
@@ -22,11 +23,13 @@ powershell -ExecutionPolicy Bypass -File <仓库目录>\scripts\install.ps1
 它做四件事（幂等，可重复跑）：
 
 1. 把插件包装进 `~/.dsh/profiles/web`（`node_modules` + profile 的 `package.json`）；
-2. 在 profile 的用户层补丁 `~/.dsh/profiles/web/cordis.patch.yml` 里写 `browser-bridge` 配置（含 `launch` 专属浏览器环境）。该层是 `patchReload: live`，**改完不用重启 dsh**；
-3. 生成「浏览器操作」Agent preset 到 `~/.dsh/.agent-presets/browser/`（复制 dsh 随附的 `standard` 组装 + 换成浏览器人设）；
+2. 在 profile 的用户层补丁 `~/.dsh/profiles/web/cordis.patch.yml` 里写 `browser-bridge` 配置（含 `launch` 专属浏览器环境）。实测 0.2.x 上改这一层会**热重组**（桥热停又热启，不用重启 dsh）；
+3. 生成「浏览器操作」Agent preset。**按目标运行时的世代选布局**：
+   - 0.2.x：在 `~/.dsh/preset-bundles/browser` 生成 bundle（一条 `@deepseek-ai/dsh-agent-preset` 声明行，组装**逐字取自目标运行时随附的** `dsh-web-app/presets/standard.patch.yml`），并登记进 profile 的 `dependencies` + `dsh.profile.bundles` + `node_modules` 链接。0.2.x **不再扫描** `~/.dsh/.agent-presets/`；
+   - 0.1.x：`~/.dsh/.agent-presets/browser/{preset.yml,agent.cordis.yml}`（复制随附 `standard` 组装 + 换成浏览器人设）。
 4. 启动专属浏览器并打开 `chrome://extensions`。
 
-常用参数：`-ProfileDir`（专属 profile 路径）、`-LaunchUrls`（拉起时打开的页面）、`-SkipPreset`、`-SkipLaunch`、`-UseCli`（改用 `dsh plugin add`）、`-SessionLoad`（跳过手动部署，用 CDP 会话级装载）。
+常用参数：`-ProfileDir`（专属浏览器 profile 路径）、`-ProfileName`（dsh profile，默认 `web`）、`-RuntimeDir`（dsh 安装目录，用于找随附的 `standard` 组装）、`-LaunchUrls`、`-SkipPreset`、`-SkipLaunch`、`-UseCli`（改用 `dsh plugin add`）、`-SessionLoad`（跳过手动部署，用 CDP 会话级装载）。
 
 ## 2. 把这段原样发给用户（唯一的手动步骤）
 
@@ -49,7 +52,7 @@ powershell -ExecutionPolicy Bypass -File <仓库目录>\scripts\install.ps1
 powershell -ExecutionPolicy Bypass -File <仓库目录>\scripts\verify-install.ps1
 ```
 
-它会通过桥的 HTTP 面下发真实命令，逐项验收：桥在监听 → 扩展已连接 → **扩展版本 = 仓库版本** → `ping` → `tabs.list` → 打开验收标签页（`chrome://` 页面挂不上调试器）→ `eval` 里 `await` 400ms（旧版有 100ms 隐形超时，这一项会挂）→ `content` 读当前页 → 接口分析 / JS 逆向能力（`cdp` / `cookies.get` / `network.log` / `network.har` / `ws.log` / `scripts.list` / `debugger.state` / `fetch.list` / `hook.log`，以及「不带 token 应被拒」）→ 「浏览器操作」模式存在 → `launch` 配置就位。全绿退出码 0。
+它会通过桥的 HTTP 面下发真实命令，逐项验收：桥在监听 → 扩展已连接 → **扩展版本 = 仓库版本** → `ping` → `tabs.list` → 打开验收标签页（`chrome://` 页面挂不上调试器）→ `eval` 里 `await` 400ms（旧版有 100ms 隐形超时，这一项会挂）→ `content` 读当前页 → 接口分析 / JS 逆向能力（`cdp` / `cookies.get` / `network.log` / `network.har` / `ws.log` / `scripts.list` / `debugger.state` / `fetch.list` / `hook.log`，以及「不带 token 应被拒」）→ 「浏览器操作」preset bundle 已安装并登记（bundle 文件 + profile 的 `dependencies`/`bundles` 登记 + `node_modules` 链接，而不是只查文件在不在）→ `launch` 配置就位。全绿退出码 0。
 
 > 「不带 token 应被拒」失败 = 运行中的 dsh 还加载着旧版插件代码（桥的 token 门是 v1.0.9 新增的）。**重启一次 DSH Desktop** 即可；这一项故意做成失败而不是跳过，就是这个用途。
 
@@ -73,13 +76,15 @@ node <仓库目录>\scripts\verify-reverse.mjs
 4. `browser_evaluate` 跑一个 >100ms 的 `await`（例如 `(async()=>{const t=Date.now();await new Promise(r=>setTimeout(r,400));return Date.now()-t})()`）；
 5. `browser_read` 读出正文。
 
-五步都过，就可以告诉用户装好了，并提示他：**新建会话时在模式选择器里选「浏览器操作」**（名单每次读取都重新扫文件系统，刷新 GUI 即可看到；preset 只能在空会话里切换）。
+五步都过，就可以告诉用户装好了，并提示他：**新建会话时在模式选择器里选「浏览器操作」**（0.2.x 的名单来自 host 侧注册表——preset 是 bundle 声明行，不再扫任何目录；刷新 GUI 即可看到。preset 只能在空会话里切换）。
 
 ## 5. 常见故障
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `no browser extension connected`，但扩展明明装过 | 这个 profile 是 `-DisableLaunch` 装的（`launch.enabled: false`），或改了 `launch` 没进到运行中的插件里 | **先自己跑** `scripts\start-browser.ps1` 把专属环境拉起来，再复跑原命令；确认补丁层里 `launch.enabled: true`；改了配置仍不自动拉起就**重启一次 dsh**（实测 `patchReload: live` 未必把 `launch.*` 重组进插件） |
+| **模式列表里没有「浏览器操作」** | 0.2.x 不再扫描 `~/.dsh/.agent-presets/`（那里只剩 0.1.x 时代的产物）；或 bundle 没进 profile 的 `dsh.profile.bundles` | 重跑 `install.ps1`（生成 `~/.dsh/preset-bundles/browser` 并登记）；确认该 profile 的 `package.json` 里 `dependencies` 与 `dsh.profile.bundles` 都有 `@local/dsh-browser-preset`；旧目录可以删掉 |
+| **插件装了，但 `browser_*` 工具一个都不出现、桥也不监听** | 插件版本低于 v1.0.10：peer 范围写的是 `<0.2.0-0`，0.2.x 的 plugin-manager 判 `incompatible-version`，整个 bundle 一行都不挂载 | 升到 v1.0.10+（peer 已放宽到 `<0.3.0-0`）；临时办法是对这一对确切版本授予版本豁免（有崩溃风险，必须用户明确同意） |
+| `no browser extension connected`，但扩展明明装过 | 这个 profile 是 `-DisableLaunch` 装的（`launch.enabled: false`），或改了 `launch` 没生效 | **先自己跑** `scripts\start-browser.ps1` 把专属环境拉起来，再复跑原命令；确认补丁层里 `launch.enabled: true`；实测 0.2.x 改补丁层会热重组（桥会热停又热启），没动静才重启 dsh |
 | `no browser extension connected` | 用户还没做第 2 步，或扩展被停用 | 让用户按第 2 步操作；确认扩展开关是开的 |
 | `Cannot access a chrome-extension:// URL of different extension` | 同一个标签页有别的扩展在抢 `debugger`（Claude / ChatGPT / 录屏类） | 让用户在**日常** Chrome 里停用本扩展，只留专属环境里那一个 |
 | `Debugger is not attached to the tab with id: N` | 调试器被抢走后扩展的内存状态过期 | 关掉专属浏览器重开；v1.0.8 起扩展会自愈 |
